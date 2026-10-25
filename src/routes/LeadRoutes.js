@@ -1429,7 +1429,7 @@ router.post('/leads/:leadId/register-student', async (req, res) => {
       mobile: lead.phone || '',
       address: lead.address || '',
       country: countryFromLead,
-      course: lead.course || '',
+      course: lead.interest || lead.course || '',
       program: lead.program || '',
       source_inquiry: lead.referred_by || '',
       status: 'Active',
