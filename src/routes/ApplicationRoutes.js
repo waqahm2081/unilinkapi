@@ -73,6 +73,8 @@ const ensureApplicationSchema = async () => {
   await ensureColumn('applications', 'apps_tagged_through_other', 'VARCHAR(255) NULL');
   await ensureColumn('applications', 'offer_letter_type', 'VARCHAR(100) NULL');
   await ensureColumn('applications', 'offer_letter_other', 'VARCHAR(255) NULL');
+  await ensureColumn('applications', 'offer_letter_path', 'VARCHAR(500) NULL');
+  await ensureColumn('applications', 'offer_letter_uploaded_at', 'DATETIME NULL');
   await ensureColumn('applications', 'initial_deposit_status', 'VARCHAR(50) NULL');
   await ensureColumn('applications', 'initial_deposit_amount', 'VARCHAR(100) NULL');
   await ensureColumn('applications', 'enrollment_fee_status', 'VARCHAR(50) NULL');
