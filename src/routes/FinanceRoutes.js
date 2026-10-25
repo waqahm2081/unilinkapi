@@ -139,6 +139,7 @@ router.get('/finance/migrate', async (req, res) => {
     `).catch(() => {});
 
     await ensureInvoiceInstallmentSchema(connection);
+    await ensureInvoiceCountryPricesSchema();
 
     await ensureFinanceLedgerSchema(connection);
 
@@ -187,6 +188,58 @@ const tableExists = async (db, tableName) => {
     [tableName]
   );
   return (rows[0]?.cnt || 0) > 0;
+};
+
+const ensureInvoiceCountryPricesSchema = async () => {
+  const db = pool;
+  if (!(await tableExists(db, 'invoice_country_prices'))) {
+    try {
+      await db.query(`
+        CREATE TABLE invoice_country_prices (
+          id           INT AUTO_INCREMENT PRIMARY KEY,
+          invoice_id   INT NOT NULL,
+          country_id   INT NULL,
+          country_name VARCHAR(255) NOT NULL,
+          price        DECIMAL(15,2) NOT NULL DEFAULT 0,
+          created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_invoice_country_prices_invoice (invoice_id)
+        )
+      `);
+    } catch (err) {
+      if (!/already exists/i.test(err.message || '')) {
+        console.warn('ensure invoice_country_prices:', err.message);
+      }
+    }
+  }
+};
+
+const fetchInvoiceCountryPrices = async (db, invoiceId) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT * FROM invoice_country_prices
+       WHERE invoice_id = ?
+       ORDER BY id ASC`,
+      [invoiceId]
+    );
+    return rows;
+  } catch {
+    return [];
+  }
+};
+
+const saveInvoiceCountryPrices = async (connection, invoiceId, selectedCountries = []) => {
+  await ensureInvoiceCountryPricesSchema();
+  await connection.query('DELETE FROM invoice_country_prices WHERE invoice_id = ?', [invoiceId]).catch(() => {});
+  if (!Array.isArray(selectedCountries) || selectedCountries.length === 0) return;
+  for (const c of selectedCountries) {
+    const name = (c.country_name || '').trim();
+    if (!name) continue;
+    await connection.query(
+      `INSERT INTO invoice_country_prices (invoice_id, country_id, country_name, price)
+       VALUES (?, ?, ?, ?)`,
+      [invoiceId, c.id || null, name, parseFloat(c.price) || 0]
+    );
+  }
 };
 
 const ensureInvoiceInstallmentSchema = async (connection) => {
@@ -1330,6 +1383,7 @@ router.get('/finance/invoices/:invoiceId', async (req, res) => {
 
     const payments = await fetchInvoicePayments(pool, invoiceId);
     const installments = await fetchInvoiceInstallments(pool, invoiceId);
+    const countryPrices = await fetchInvoiceCountryPrices(pool, invoiceId);
 
     res.json({
       success: true,
@@ -1340,7 +1394,8 @@ router.get('/finance/invoices/:invoiceId', async (req, res) => {
       commissionStudents,
       defaultServices,
       payments,
-      installments
+      installments,
+      countryPrices
     });
   } catch (error) {
     console.error('Error fetching invoice:', error);
@@ -1448,8 +1503,9 @@ router.post('/finance/invoices', async (req, res) => {
   // Ensure schema before opening a transaction (DDL auto-commits on MySQL)
   try {
     await ensureInvoiceInstallmentSchema();
+    await ensureInvoiceCountryPricesSchema();
   } catch (err) {
-    console.warn('Installment schema ensure failed:', err.message);
+    console.warn('Invoice schema ensure failed:', err.message);
   }
 
   const connection = await pool.getConnection();
@@ -1639,6 +1695,11 @@ router.post('/finance/invoices', async (req, res) => {
       }
     }
 
+    // ── Per-country prices (Student) ──
+    if (invoiceType === 'Student') {
+      await saveInvoiceCountryPrices(connection, newInvoiceId, selectedCountries);
+    }
+
     // ── Selected default services (Student only) ──
     if (invoiceType === 'Student' && Array.isArray(selectedDefaultServices) && selectedDefaultServices.length > 0) {
       for (const ds of selectedDefaultServices) {
@@ -1777,8 +1838,9 @@ router.post('/finance/invoices', async (req, res) => {
 router.put('/finance/invoices/:invoiceId', async (req, res) => {
   try {
     await ensureInvoiceInstallmentSchema();
+    await ensureInvoiceCountryPricesSchema();
   } catch (err) {
-    console.warn('Installment schema ensure failed:', err.message);
+    console.warn('Invoice schema ensure failed:', err.message);
   }
 
   const connection = await pool.getConnection();
@@ -1983,6 +2045,10 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
             );
           }
         }
+      }
+
+      if (invoiceType === 'Student') {
+        await saveInvoiceCountryPrices(connection, invoiceId, selectedCountries);
       }
 
       if (invoiceType === 'Student' && Array.isArray(selectedDefaultServices) && selectedDefaultServices.length > 0) {
