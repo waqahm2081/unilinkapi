@@ -138,6 +138,8 @@ router.get('/finance/migrate', async (req, res) => {
       WHERE i.paid_amount IS NOT NULL AND i.paid_amount > 0 AND p.id IS NULL
     `).catch(() => {});
 
+    await ensureInvoiceInstallmentSchema(connection);
+
     await ensureFinanceLedgerSchema(connection);
 
     res.json({ success: true, message: 'Migration applied successfully' });
@@ -162,6 +164,120 @@ const syncLeadPaymentStatus = async (connection, invoiceId, paymentStatus) => {
     'UPDATE leads SET payment_status = ? WHERE invoice_id = ?',
     [leadPaymentStatus, invoiceId]
   ).catch(() => {});
+};
+
+const ensureInvoiceInstallmentSchema = async (connection) => {
+  const db = connection || pool;
+  await db.query(`
+    ALTER TABLE invoices
+    ADD COLUMN IF NOT EXISTS has_installment_plan TINYINT(1) NOT NULL DEFAULT 0
+  `).catch(async () => {
+    try {
+      await db.query(`ALTER TABLE invoices ADD COLUMN has_installment_plan TINYINT(1) NOT NULL DEFAULT 0`);
+    } catch { /* already exists */ }
+  });
+  await db.query(`
+    ALTER TABLE invoices
+    ADD COLUMN IF NOT EXISTS advance_amount DECIMAL(15,2) NOT NULL DEFAULT 0
+  `).catch(async () => {
+    try {
+      await db.query(`ALTER TABLE invoices ADD COLUMN advance_amount DECIMAL(15,2) NOT NULL DEFAULT 0`);
+    } catch { /* already exists */ }
+  });
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS invoice_installments (
+      id                  INT AUTO_INCREMENT PRIMARY KEY,
+      invoice_id          INT NOT NULL,
+      installment_number  INT NOT NULL,
+      amount              DECIMAL(15,2) NOT NULL DEFAULT 0,
+      due_date            DATE NOT NULL,
+      status              ENUM('Pending','Paid','Partial') NOT NULL DEFAULT 'Pending',
+      paid_amount         DECIMAL(15,2) NOT NULL DEFAULT 0,
+      created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_invoice_installments_invoice (invoice_id),
+      FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+    )
+  `).catch(() => {});
+};
+
+const fetchInvoiceInstallments = async (db, invoiceId) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT * FROM invoice_installments
+       WHERE invoice_id = ?
+       ORDER BY installment_number ASC, id ASC`,
+      [invoiceId]
+    );
+    return rows;
+  } catch {
+    return [];
+  }
+};
+
+const saveInvoiceInstallmentPlan = async (connection, invoiceId, {
+  hasInstallmentPlan = false,
+  advanceAmount = 0,
+  installments = [],
+}) => {
+  await ensureInvoiceInstallmentSchema(connection);
+  const enabled = !!hasInstallmentPlan;
+  const advance = Math.max(0, parseFloat(advanceAmount) || 0);
+
+  await connection.query(
+    `UPDATE invoices SET has_installment_plan = ?, advance_amount = ? WHERE id = ?`,
+    [enabled ? 1 : 0, advance, invoiceId]
+  );
+
+  await connection.query('DELETE FROM invoice_installments WHERE invoice_id = ?', [invoiceId]);
+
+  if (!enabled || !Array.isArray(installments) || installments.length === 0) return;
+
+  let number = 1;
+  for (const row of installments) {
+    const amount = parseFloat(row.amount ?? row.installment_amount) || 0;
+    const dueDate = row.dueDate || row.due_date;
+    if (!dueDate || amount <= 0) continue;
+    await connection.query(
+      `INSERT INTO invoice_installments
+         (invoice_id, installment_number, amount, due_date, status, paid_amount)
+       VALUES (?, ?, ?, ?, 'Pending', 0)`,
+      [invoiceId, number, amount, dueDate]
+    );
+    number += 1;
+  }
+};
+
+/** Allocate payments beyond the advance toward planned installments (in order). */
+const allocatePaymentsToInstallments = async (connection, invoiceId) => {
+  try {
+    await ensureInvoiceInstallmentSchema(connection);
+    const [invRows] = await connection.query(
+      'SELECT advance_amount, has_installment_plan FROM invoices WHERE id = ?',
+      [invoiceId]
+    );
+    if (!invRows.length || !invRows[0].has_installment_plan) return;
+
+    const advance = parseFloat(invRows[0].advance_amount) || 0;
+    const payments = await fetchInvoicePayments(connection, invoiceId);
+    const totalPaid = payments.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
+    let remaining = Math.max(0, Math.round((totalPaid - advance) * 100) / 100);
+
+    const installments = await fetchInvoiceInstallments(connection, invoiceId);
+    for (const inst of installments) {
+      const due = parseFloat(inst.amount) || 0;
+      const paidToward = Math.min(due, remaining);
+      remaining = Math.round((remaining - paidToward) * 100) / 100;
+      let status = 'Pending';
+      if (paidToward + 0.001 >= due && due > 0) status = 'Paid';
+      else if (paidToward > 0) status = 'Partial';
+      await connection.query(
+        `UPDATE invoice_installments SET paid_amount = ?, status = ? WHERE id = ?`,
+        [paidToward, status, inst.id]
+      );
+    }
+  } catch (err) {
+    console.warn('allocatePaymentsToInstallments:', err.message);
+  }
 };
 
 const recomputeInvoicePaymentTotals = async (connection, invoiceId, statusOverride = null) => {
@@ -197,6 +313,7 @@ const recomputeInvoicePaymentTotals = async (connection, invoiceId, statusOverri
     [totalPaid, lastDate, paymentStatus, invoiceId]
   );
   await syncLeadPaymentStatus(connection, invoiceId, paymentStatus);
+  await allocatePaymentsToInstallments(connection, invoiceId);
 
   return { totalPaid, lastDate, paymentStatus };
 };
@@ -1166,6 +1283,7 @@ router.get('/finance/invoices/:invoiceId', async (req, res) => {
     }
 
     const payments = await fetchInvoicePayments(pool, invoiceId);
+    const installments = await fetchInvoiceInstallments(pool, invoiceId);
 
     res.json({
       success: true,
@@ -1175,7 +1293,8 @@ router.get('/finance/invoices/:invoiceId', async (req, res) => {
       agentStudents,
       commissionStudents,
       defaultServices,
-      payments
+      payments,
+      installments
     });
   } catch (error) {
     console.error('Error fetching invoice:', error);
@@ -1304,7 +1423,14 @@ router.post('/finance/invoices', async (req, res) => {
       notes,
       selectedCurrency, exchangeRate, convertedAmount,
       showConvertedCurrency,       // boolean — whether to show foreign currency on PDF
+      // Advance + optional installment plan
+      advanceAmount,
+      advanceDate,
+      hasInstallmentPlan,
+      installments,
     } = req.body;
+
+    await ensureInvoiceInstallmentSchema(connection);
 
     if (!invoiceType || !invoiceDate) {
       await connection.rollback();
@@ -1527,6 +1653,41 @@ router.post('/finance/invoices', async (req, res) => {
       }
     }
 
+    // ── Advance + optional installment plan ──
+    const resolvedAdvance = Math.max(0, parseFloat(advanceAmount) || 0);
+    await saveInvoiceInstallmentPlan(connection, newInvoiceId, {
+      hasInstallmentPlan: !!hasInstallmentPlan,
+      advanceAmount: resolvedAdvance,
+      installments: Array.isArray(installments) ? installments : [],
+    });
+
+    if (resolvedAdvance > 0) {
+      await connection.query(`
+        CREATE TABLE IF NOT EXISTS invoice_payments (
+          id           INT AUTO_INCREMENT PRIMARY KEY,
+          invoice_id   INT NOT NULL,
+          amount       DECIMAL(15,2) NOT NULL DEFAULT 0,
+          payment_date DATE NOT NULL,
+          notes        TEXT NULL,
+          created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_invoice_payments_invoice (invoice_id),
+          FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+        )
+      `).catch(() => {});
+
+      await connection.query(
+        `INSERT INTO invoice_payments (invoice_id, amount, payment_date, notes)
+         VALUES (?, ?, ?, ?)`,
+        [
+          newInvoiceId,
+          resolvedAdvance,
+          advanceDate || invoiceDate,
+          'Advance'
+        ]
+      );
+      await recomputeInvoicePaymentTotals(connection, newInvoiceId);
+    }
+
     await connection.commit();
     res.status(201).json({
       success: true, message: 'Invoice created successfully',
@@ -1549,6 +1710,7 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
+    await ensureInvoiceInstallmentSchema(connection);
     const { invoiceId } = req.params;
     const {
       fullEdit,
@@ -1568,10 +1730,11 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
       commissionStudents, agentStudents,
       extraServices, selectedCountryServices, selectedDefaultServices,
       selectedCurrency, exchangeRate, convertedAmount,
+      advanceAmount, advanceDate, hasInstallmentPlan, installments,
     } = req.body;
 
     const [existing] = await connection.query(
-      'SELECT id, paid_amount, final_amount, invoice_type, is_manual_student, agent_id, student_id FROM invoices WHERE id = ?',
+      'SELECT id, paid_amount, final_amount, invoice_type, is_manual_student, agent_id, student_id, advance_amount FROM invoices WHERE id = ?',
       [invoiceId]
     );
     if (existing.length === 0) {
@@ -1808,6 +1971,48 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
         }
       }
 
+      // Advance + optional installment plan
+      const resolvedAdvance = Math.max(0, parseFloat(advanceAmount) || 0);
+      await saveInvoiceInstallmentPlan(connection, invoiceId, {
+        hasInstallmentPlan: !!hasInstallmentPlan,
+        advanceAmount: resolvedAdvance,
+        installments: Array.isArray(installments) ? installments : [],
+      });
+
+      // Sync the Advance payment row (create / update / remove)
+      await connection.query(`
+        CREATE TABLE IF NOT EXISTS invoice_payments (
+          id           INT AUTO_INCREMENT PRIMARY KEY,
+          invoice_id   INT NOT NULL,
+          amount       DECIMAL(15,2) NOT NULL DEFAULT 0,
+          payment_date DATE NOT NULL,
+          notes        TEXT NULL,
+          created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_invoice_payments_invoice (invoice_id),
+          FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+        )
+      `).catch(() => {});
+
+      const [advanceRows] = await connection.query(
+        `SELECT id FROM invoice_payments WHERE invoice_id = ? AND notes = 'Advance' ORDER BY id ASC LIMIT 1`,
+        [invoiceId]
+      );
+      if (resolvedAdvance > 0) {
+        if (advanceRows.length > 0) {
+          await connection.query(
+            `UPDATE invoice_payments SET amount = ?, payment_date = ? WHERE id = ?`,
+            [resolvedAdvance, advanceDate || invoiceDate || toYMD(new Date()), advanceRows[0].id]
+          );
+        } else {
+          await connection.query(
+            `INSERT INTO invoice_payments (invoice_id, amount, payment_date, notes) VALUES (?, ?, ?, 'Advance')`,
+            [invoiceId, resolvedAdvance, advanceDate || invoiceDate || toYMD(new Date())]
+          );
+        }
+      } else if (advanceRows.length > 0) {
+        await connection.query('DELETE FROM invoice_payments WHERE id = ?', [advanceRows[0].id]);
+      }
+
       // Recompute payment status against possibly new final amount
       const totals = await recomputeInvoicePaymentTotals(connection, invoiceId, null);
 
@@ -1816,7 +2021,8 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
         success: true,
         message: 'Invoice updated successfully',
         paymentStatus: totals?.paymentStatus,
-        payments: await fetchInvoicePayments(pool, invoiceId)
+        payments: await fetchInvoicePayments(pool, invoiceId),
+        installments: await fetchInvoiceInstallments(pool, invoiceId)
       });
     }
 
