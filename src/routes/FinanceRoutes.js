@@ -166,38 +166,84 @@ const syncLeadPaymentStatus = async (connection, invoiceId, paymentStatus) => {
   ).catch(() => {});
 };
 
+const columnExists = async (db, tableName, columnName) => {
+  const [rows] = await db.query(
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = ?
+       AND COLUMN_NAME = ?`,
+    [tableName, columnName]
+  );
+  return (rows[0]?.cnt || 0) > 0;
+};
+
+const tableExists = async (db, tableName) => {
+  const [rows] = await db.query(
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.TABLES
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = ?`,
+    [tableName]
+  );
+  return (rows[0]?.cnt || 0) > 0;
+};
+
 const ensureInvoiceInstallmentSchema = async (connection) => {
-  const db = connection || pool;
-  await db.query(`
-    ALTER TABLE invoices
-    ADD COLUMN IF NOT EXISTS has_installment_plan TINYINT(1) NOT NULL DEFAULT 0
-  `).catch(async () => {
+  // Use pool for DDL so we never ALTER inside an open invoice transaction
+  // (MySQL auto-commits DDL and can leave creates half-applied).
+  const db = pool;
+
+  if (!(await columnExists(db, 'invoices', 'has_installment_plan'))) {
     try {
-      await db.query(`ALTER TABLE invoices ADD COLUMN has_installment_plan TINYINT(1) NOT NULL DEFAULT 0`);
-    } catch { /* already exists */ }
-  });
-  await db.query(`
-    ALTER TABLE invoices
-    ADD COLUMN IF NOT EXISTS advance_amount DECIMAL(15,2) NOT NULL DEFAULT 0
-  `).catch(async () => {
+      await db.query(
+        `ALTER TABLE invoices
+         ADD COLUMN has_installment_plan TINYINT(1) NOT NULL DEFAULT 0`
+      );
+    } catch (err) {
+      if (!/Duplicate column/i.test(err.message || '')) {
+        console.warn('ensure has_installment_plan:', err.message);
+      }
+    }
+  }
+
+  if (!(await columnExists(db, 'invoices', 'advance_amount'))) {
     try {
-      await db.query(`ALTER TABLE invoices ADD COLUMN advance_amount DECIMAL(15,2) NOT NULL DEFAULT 0`);
-    } catch { /* already exists */ }
-  });
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS invoice_installments (
-      id                  INT AUTO_INCREMENT PRIMARY KEY,
-      invoice_id          INT NOT NULL,
-      installment_number  INT NOT NULL,
-      amount              DECIMAL(15,2) NOT NULL DEFAULT 0,
-      due_date            DATE NOT NULL,
-      status              ENUM('Pending','Paid','Partial') NOT NULL DEFAULT 'Pending',
-      paid_amount         DECIMAL(15,2) NOT NULL DEFAULT 0,
-      created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_invoice_installments_invoice (invoice_id),
-      FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
-    )
-  `).catch(() => {});
+      await db.query(
+        `ALTER TABLE invoices
+         ADD COLUMN advance_amount DECIMAL(15,2) NOT NULL DEFAULT 0`
+      );
+    } catch (err) {
+      if (!/Duplicate column/i.test(err.message || '')) {
+        console.warn('ensure advance_amount:', err.message);
+      }
+    }
+  }
+
+  if (!(await tableExists(db, 'invoice_installments'))) {
+    try {
+      await db.query(`
+        CREATE TABLE invoice_installments (
+          id                  INT AUTO_INCREMENT PRIMARY KEY,
+          invoice_id          INT NOT NULL,
+          installment_number  INT NOT NULL,
+          amount              DECIMAL(15,2) NOT NULL DEFAULT 0,
+          due_date            DATE NOT NULL,
+          status              ENUM('Pending','Paid','Partial') NOT NULL DEFAULT 'Pending',
+          paid_amount         DECIMAL(15,2) NOT NULL DEFAULT 0,
+          created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_invoice_installments_invoice (invoice_id)
+        )
+      `);
+    } catch (err) {
+      if (!/already exists/i.test(err.message || '')) {
+        console.warn('ensure invoice_installments:', err.message);
+      }
+    }
+  }
+
+  // Keep signature compatible; connection arg unused for DDL
+  void connection;
 };
 
 const fetchInvoiceInstallments = async (db, invoiceId) => {
@@ -1399,6 +1445,13 @@ router.get('/finance/invoices/:invoiceId/payments', async (req, res) => {
 // ============================================================
 
 router.post('/finance/invoices', async (req, res) => {
+  // Ensure schema before opening a transaction (DDL auto-commits on MySQL)
+  try {
+    await ensureInvoiceInstallmentSchema();
+  } catch (err) {
+    console.warn('Installment schema ensure failed:', err.message);
+  }
+
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
@@ -1429,8 +1482,6 @@ router.post('/finance/invoices', async (req, res) => {
       hasInstallmentPlan,
       installments,
     } = req.body;
-
-    await ensureInvoiceInstallmentSchema(connection);
 
     if (!invoiceType || !invoiceDate) {
       await connection.rollback();
@@ -1655,11 +1706,21 @@ router.post('/finance/invoices', async (req, res) => {
 
     // ── Advance + optional installment plan ──
     const resolvedAdvance = Math.max(0, parseFloat(advanceAmount) || 0);
-    await saveInvoiceInstallmentPlan(connection, newInvoiceId, {
-      hasInstallmentPlan: !!hasInstallmentPlan,
-      advanceAmount: resolvedAdvance,
-      installments: Array.isArray(installments) ? installments : [],
-    });
+    try {
+      await saveInvoiceInstallmentPlan(connection, newInvoiceId, {
+        hasInstallmentPlan: !!hasInstallmentPlan,
+        advanceAmount: resolvedAdvance,
+        installments: Array.isArray(installments) ? installments : [],
+      });
+    } catch (planErr) {
+      console.error('Failed saving installment plan:', planErr);
+      await connection.rollback();
+      return res.status(500).json({
+        success: false,
+        message: 'Invoice amounts saved structure failed for advance/installments. Please open /finance/migrate once, then try again.',
+        detail: planErr.message
+      });
+    }
 
     if (resolvedAdvance > 0) {
       await connection.query(`
@@ -1670,8 +1731,7 @@ router.post('/finance/invoices', async (req, res) => {
           payment_date DATE NOT NULL,
           notes        TEXT NULL,
           created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          INDEX idx_invoice_payments_invoice (invoice_id),
-          FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+          INDEX idx_invoice_payments_invoice (invoice_id)
         )
       `).catch(() => {});
 
@@ -1691,12 +1751,20 @@ router.post('/finance/invoices', async (req, res) => {
     await connection.commit();
     res.status(201).json({
       success: true, message: 'Invoice created successfully',
-      invoiceId: newInvoiceId, generatedInvoiceId: invoiceId
+      invoiceId: newInvoiceId, generatedInvoiceId: invoiceId,
+      hasInstallmentPlan: !!hasInstallmentPlan,
+      advanceAmount: resolvedAdvance
     });
   } catch (error) {
     await connection.rollback();
     console.error('Error creating invoice:', error);
-    res.status(500).json({ success: false, message: 'Failed to create invoice' });
+    res.status(500).json({
+      success: false,
+      message: error.message?.includes('Unknown column')
+        ? 'Database is missing advance/installment columns. Open /finance/migrate once, then create the invoice again.'
+        : 'Failed to create invoice',
+      detail: error.message
+    });
   } finally {
     connection.release();
   }
@@ -1707,10 +1775,15 @@ router.post('/finance/invoices', async (req, res) => {
 // ============================================================
 
 router.put('/finance/invoices/:invoiceId', async (req, res) => {
+  try {
+    await ensureInvoiceInstallmentSchema();
+  } catch (err) {
+    console.warn('Installment schema ensure failed:', err.message);
+  }
+
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    await ensureInvoiceInstallmentSchema(connection);
     const { invoiceId } = req.params;
     const {
       fullEdit,
