@@ -140,6 +140,7 @@ router.get('/finance/migrate', async (req, res) => {
 
     await ensureInvoiceInstallmentSchema(connection);
     await ensureInvoiceCountryPricesSchema();
+    await ensureInvoicePaymentsMethodSchema();
 
     await ensureFinanceLedgerSchema(connection);
 
@@ -188,6 +189,80 @@ const tableExists = async (db, tableName) => {
     [tableName]
   );
   return (rows[0]?.cnt || 0) > 0;
+};
+
+const ensureInvoicePaymentsMethodSchema = async () => {
+  const db = pool;
+  if (!(await tableExists(db, 'invoice_payments'))) {
+    try {
+      await db.query(`
+        CREATE TABLE invoice_payments (
+          id               INT AUTO_INCREMENT PRIMARY KEY,
+          invoice_id       INT NOT NULL,
+          amount           DECIMAL(15,2) NOT NULL DEFAULT 0,
+          payment_date     DATE NOT NULL,
+          notes            TEXT NULL,
+          payment_method   ENUM('bank','cash') NULL,
+          bank_account_id  INT NULL,
+          created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_invoice_payments_invoice (invoice_id)
+        )
+      `);
+    } catch (err) {
+      if (!/already exists/i.test(err.message || '')) {
+        console.warn('ensure invoice_payments:', err.message);
+      }
+    }
+  }
+  if (!(await columnExists(db, 'invoice_payments', 'payment_method'))) {
+    try {
+      await db.query(
+        `ALTER TABLE invoice_payments
+         ADD COLUMN payment_method ENUM('bank','cash') NULL`
+      );
+    } catch (err) {
+      if (!/Duplicate column/i.test(err.message || '')) {
+        console.warn('ensure invoice_payments.payment_method:', err.message);
+      }
+    }
+  }
+  if (!(await columnExists(db, 'invoice_payments', 'bank_account_id'))) {
+    try {
+      await db.query(
+        `ALTER TABLE invoice_payments
+         ADD COLUMN bank_account_id INT NULL`
+      );
+    } catch (err) {
+      if (!/Duplicate column/i.test(err.message || '')) {
+        console.warn('ensure invoice_payments.bank_account_id:', err.message);
+      }
+    }
+  }
+};
+
+const resolvePaymentMethodFields = async (connection, paymentMethod, bankAccountId, { required = true } = {}) => {
+  if (!required && (paymentMethod == null || paymentMethod === '')) {
+    return { paymentMethod: 'bank', bankAccountId: null };
+  }
+  const method = paymentMethod === 'cash' ? 'cash' : 'bank';
+  if (method === 'bank') {
+    if (!bankAccountId) {
+      const err = new Error('Bank account is required for bank transfers');
+      err.status = 400;
+      throw err;
+    }
+    const [bank] = await connection.query(
+      'SELECT id FROM bank_accounts WHERE id = ? AND status = ?',
+      [bankAccountId, 'Active']
+    );
+    if (bank.length === 0) {
+      const err = new Error('Bank account not found or inactive');
+      err.status = 404;
+      throw err;
+    }
+    return { paymentMethod: method, bankAccountId };
+  }
+  return { paymentMethod: method, bankAccountId: null };
 };
 
 const ensureInvoiceCountryPricesSchema = async () => {
@@ -512,9 +587,12 @@ const getCashOpeningBalance = async (db) => {
 
 const loadInvoiceLedgerRows = async (db) => {
   try {
+    await ensureInvoicePaymentsMethodSchema();
     const [rows] = await db.query(`
       SELECT p.amount, DATE_FORMAT(p.payment_date, '%Y-%m-%d') AS payment_date,
-             i.bank_account_id, i.payment_method, i.invoice_type, i.payment_status
+             COALESCE(p.bank_account_id, i.bank_account_id) AS bank_account_id,
+             COALESCE(p.payment_method, i.payment_method) AS payment_method,
+             i.invoice_type, i.payment_status
       FROM invoice_payments p
       INNER JOIN invoices i ON i.id = p.invoice_id
       WHERE i.payment_status IN ('Paid', 'Partially Paid')
@@ -652,17 +730,20 @@ const loadBankAccountTransactions = async (db, accountId, dateFrom, dateTo) => {
   const accountKey = Number(accountId);
 
   try {
+    await ensureInvoicePaymentsMethodSchema();
     const [paymentRows] = await db.query(`
       SELECT p.amount,
              DATE_FORMAT(p.payment_date, '%Y-%m-%d') AS txn_date,
-             i.invoice_id, i.invoice_type, i.payment_method, i.payment_status,
+             i.invoice_id, i.invoice_type,
+             COALESCE(p.payment_method, i.payment_method) AS payment_method,
+             i.payment_status,
              i.student_name, i.manual_student_name, i.university_name,
              a.agent_name
       FROM invoice_payments p
       INNER JOIN invoices i ON i.id = p.invoice_id
       LEFT JOIN agents a ON a.id = i.agent_id
-      WHERE i.bank_account_id = ?
-        AND (i.payment_method IS NULL OR i.payment_method != 'cash')
+      WHERE COALESCE(p.bank_account_id, i.bank_account_id) = ?
+        AND COALESCE(p.payment_method, i.payment_method, 'bank') != 'cash'
         AND i.payment_status IN ('Paid', 'Partially Paid')
       ORDER BY p.payment_date DESC, p.id DESC
     `, [accountKey]);
@@ -794,17 +875,34 @@ const loadBankAccountTransactions = async (db, accountId, dateFrom, dateTo) => {
 
 const fetchInvoicePayments = async (db, invoiceId) => {
   try {
+    await ensureInvoicePaymentsMethodSchema();
     const [payments] = await db.query(
-      `SELECT id, invoice_id, amount, payment_date, notes, created_at
-       FROM invoice_payments
-       WHERE invoice_id = ?
-       ORDER BY payment_date ASC, id ASC`,
+      `SELECT p.id, p.invoice_id, p.amount, p.payment_date, p.notes, p.created_at,
+              p.payment_method, p.bank_account_id,
+              ba.account_name, ba.bank_name
+       FROM invoice_payments p
+       LEFT JOIN bank_accounts ba ON ba.id = p.bank_account_id
+       WHERE p.invoice_id = ?
+       ORDER BY p.payment_date ASC, p.id ASC`,
       [invoiceId]
     );
     return payments;
   } catch (err) {
     if (err.code === 'ER_NO_SUCH_TABLE') return [];
-    throw err;
+    // Fallback if columns not yet migrated
+    try {
+      const [payments] = await db.query(
+        `SELECT id, invoice_id, amount, payment_date, notes, created_at
+         FROM invoice_payments
+         WHERE invoice_id = ?
+         ORDER BY payment_date ASC, id ASC`,
+        [invoiceId]
+      );
+      return payments;
+    } catch (err2) {
+      if (err2.code === 'ER_NO_SUCH_TABLE') return [];
+      throw err;
+    }
   }
 };
 
@@ -1410,9 +1508,10 @@ router.get('/finance/invoices/:invoiceId', async (req, res) => {
 router.post('/finance/invoices/:invoiceId/payments', async (req, res) => {
   const connection = await pool.getConnection();
   try {
+    await ensureInvoicePaymentsMethodSchema();
     await connection.beginTransaction();
     const { invoiceId } = req.params;
-    const { amount, paymentDate, notes, paymentStatus } = req.body;
+    const { amount, paymentDate, notes, paymentStatus, paymentMethod, bankAccountId } = req.body;
 
     const [existing] = await connection.query(
       'SELECT id, final_amount, paid_amount FROM invoices WHERE id = ?',
@@ -1434,24 +1533,31 @@ router.post('/finance/invoices/:invoiceId/payments', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Payment date is required' });
     }
 
-    // Ensure table exists (safe for first use before migrate)
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS invoice_payments (
-        id           INT AUTO_INCREMENT PRIMARY KEY,
-        invoice_id   INT NOT NULL,
-        amount       DECIMAL(15,2) NOT NULL DEFAULT 0,
-        payment_date DATE NOT NULL,
-        notes        TEXT NULL,
-        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_invoice_payments_invoice (invoice_id),
-        FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
-      )
-    `).catch(() => {});
+    let methodFields;
+    try {
+      methodFields = await resolvePaymentMethodFields(connection, paymentMethod, bankAccountId, { required: true });
+    } catch (err) {
+      await connection.rollback();
+      return res.status(err.status || 400).json({ success: false, message: err.message });
+    }
 
     const [insertResult] = await connection.query(
-      `INSERT INTO invoice_payments (invoice_id, amount, payment_date, notes)
-       VALUES (?, ?, ?, ?)`,
-      [invoiceId, paymentAmount, paymentDate, notes?.trim() || null]
+      `INSERT INTO invoice_payments (invoice_id, amount, payment_date, notes, payment_method, bank_account_id)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        invoiceId,
+        paymentAmount,
+        paymentDate,
+        notes?.trim() || null,
+        methodFields.paymentMethod,
+        methodFields.bankAccountId
+      ]
+    );
+
+    // Keep invoice-level "Payment Via" in sync with the latest payment
+    await connection.query(
+      `UPDATE invoices SET payment_method = ?, bank_account_id = ? WHERE id = ?`,
+      [methodFields.paymentMethod, methodFields.bankAccountId, invoiceId]
     );
 
     const totals = await recomputeInvoicePaymentTotals(
@@ -1504,6 +1610,7 @@ router.post('/finance/invoices', async (req, res) => {
   try {
     await ensureInvoiceInstallmentSchema();
     await ensureInvoiceCountryPricesSchema();
+    await ensureInvoicePaymentsMethodSchema();
   } catch (err) {
     console.warn('Invoice schema ensure failed:', err.message);
   }
@@ -1544,17 +1651,17 @@ router.post('/finance/invoices', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invoice type and date are required' });
     }
 
-    const resolvedPaymentMethod = paymentMethod === 'cash' ? 'cash' : 'bank';
-
-    if (resolvedPaymentMethod === 'bank') {
-      if (!bankAccountId) {
+    const resolvedAdvancePreview = Math.max(0, parseFloat(advanceAmount) || 0);
+    let resolvedPaymentMethod = 'bank';
+    let resolvedBankAccountId = null;
+    if (resolvedAdvancePreview > 0) {
+      try {
+        const methodFields = await resolvePaymentMethodFields(connection, paymentMethod, bankAccountId, { required: true });
+        resolvedPaymentMethod = methodFields.paymentMethod;
+        resolvedBankAccountId = methodFields.bankAccountId;
+      } catch (err) {
         await connection.rollback();
-        return res.status(400).json({ success: false, message: 'Bank account is required for bank transfers' });
-      }
-      const [bank] = await connection.query('SELECT id FROM bank_accounts WHERE id = ? AND status = ?', [bankAccountId, 'Active']);
-      if (bank.length === 0) {
-        await connection.rollback();
-        return res.status(404).json({ success: false, message: 'Bank account not found or inactive' });
+        return res.status(err.status || 400).json({ success: false, message: err.message });
       }
     }
 
@@ -1639,7 +1746,7 @@ router.post('/finance/invoices', async (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)`,
       [
         invoiceId, invoiceType, invoiceDate, dueDate || null,
-        resolvedPaymentMethod, resolvedPaymentMethod === 'bank' ? (bankAccountId || null) : null,
+        resolvedPaymentMethod, resolvedBankAccountId,
         isManualStudent ? null : (studentId || null),
         isManualStudent ? (manualStudentName?.trim() || null) : studentName,
         isManualStudent ? null : studentRefId,
@@ -1784,26 +1891,17 @@ router.post('/finance/invoices', async (req, res) => {
     }
 
     if (resolvedAdvance > 0) {
-      await connection.query(`
-        CREATE TABLE IF NOT EXISTS invoice_payments (
-          id           INT AUTO_INCREMENT PRIMARY KEY,
-          invoice_id   INT NOT NULL,
-          amount       DECIMAL(15,2) NOT NULL DEFAULT 0,
-          payment_date DATE NOT NULL,
-          notes        TEXT NULL,
-          created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          INDEX idx_invoice_payments_invoice (invoice_id)
-        )
-      `).catch(() => {});
-
+      await ensureInvoicePaymentsMethodSchema();
       await connection.query(
-        `INSERT INTO invoice_payments (invoice_id, amount, payment_date, notes)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO invoice_payments (invoice_id, amount, payment_date, notes, payment_method, bank_account_id)
+         VALUES (?, ?, ?, ?, ?, ?)`,
         [
           newInvoiceId,
           resolvedAdvance,
           advanceDate || invoiceDate,
-          'Advance'
+          'Advance',
+          resolvedPaymentMethod,
+          resolvedBankAccountId
         ]
       );
       await recomputeInvoicePaymentTotals(connection, newInvoiceId);
@@ -1839,6 +1937,7 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
   try {
     await ensureInvoiceInstallmentSchema();
     await ensureInvoiceCountryPricesSchema();
+    await ensureInvoicePaymentsMethodSchema();
   } catch (err) {
     console.warn('Invoice schema ensure failed:', err.message);
   }
@@ -1869,7 +1968,7 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
     } = req.body;
 
     const [existing] = await connection.query(
-      'SELECT id, paid_amount, final_amount, invoice_type, is_manual_student, agent_id, student_id, advance_amount FROM invoices WHERE id = ?',
+      'SELECT id, paid_amount, final_amount, invoice_type, is_manual_student, agent_id, student_id, advance_amount, payment_method, bank_account_id FROM invoices WHERE id = ?',
       [invoiceId]
     );
     if (existing.length === 0) {
@@ -1883,16 +1982,18 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
 
     // ── Full edit: replace invoice fields + related service/student rows ──
     if (fullEdit) {
-      const resolvedPaymentMethod = paymentMethod === 'cash' ? 'cash' : 'bank';
-      if (resolvedPaymentMethod === 'bank') {
-        if (!bankAccountId) {
+      const resolvedAdvanceForMethod = Math.max(0, parseFloat(advanceAmount) || 0);
+      // Preserve existing via when no advance is being recorded on this save
+      let resolvedPaymentMethod = existing[0].payment_method === 'cash' ? 'cash' : 'bank';
+      let resolvedBankAccountId = existing[0].bank_account_id || null;
+      if (resolvedAdvanceForMethod > 0) {
+        try {
+          const methodFields = await resolvePaymentMethodFields(connection, paymentMethod, bankAccountId, { required: true });
+          resolvedPaymentMethod = methodFields.paymentMethod;
+          resolvedBankAccountId = methodFields.bankAccountId;
+        } catch (err) {
           await connection.rollback();
-          return res.status(400).json({ success: false, message: 'Bank account is required for bank transfers' });
-        }
-        const [bank] = await connection.query('SELECT id FROM bank_accounts WHERE id = ? AND status = ?', [bankAccountId, 'Active']);
-        if (bank.length === 0) {
-          await connection.rollback();
-          return res.status(404).json({ success: false, message: 'Bank account not found or inactive' });
+          return res.status(err.status || 400).json({ success: false, message: err.message });
         }
       }
 
@@ -1967,7 +2068,7 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
           invoiceDate || null,
           dueDate || null,
           resolvedPaymentMethod,
-          resolvedPaymentMethod === 'bank' ? (bankAccountId || null) : null,
+          resolvedBankAccountId,
           invoiceType === 'Student'
             ? (isManualStudent ? null : (studentId || null))
             : existing[0].student_id,
@@ -2119,19 +2220,7 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
       });
 
       // Sync the Advance payment row (create / update / remove)
-      await connection.query(`
-        CREATE TABLE IF NOT EXISTS invoice_payments (
-          id           INT AUTO_INCREMENT PRIMARY KEY,
-          invoice_id   INT NOT NULL,
-          amount       DECIMAL(15,2) NOT NULL DEFAULT 0,
-          payment_date DATE NOT NULL,
-          notes        TEXT NULL,
-          created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          INDEX idx_invoice_payments_invoice (invoice_id),
-          FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
-        )
-      `).catch(() => {});
-
+      await ensureInvoicePaymentsMethodSchema();
       const [advanceRows] = await connection.query(
         `SELECT id FROM invoice_payments WHERE invoice_id = ? AND notes = 'Advance' ORDER BY id ASC LIMIT 1`,
         [invoiceId]
@@ -2139,13 +2228,28 @@ router.put('/finance/invoices/:invoiceId', async (req, res) => {
       if (resolvedAdvance > 0) {
         if (advanceRows.length > 0) {
           await connection.query(
-            `UPDATE invoice_payments SET amount = ?, payment_date = ? WHERE id = ?`,
-            [resolvedAdvance, advanceDate || invoiceDate || toYMD(new Date()), advanceRows[0].id]
+            `UPDATE invoice_payments
+             SET amount = ?, payment_date = ?, payment_method = ?, bank_account_id = ?
+             WHERE id = ?`,
+            [
+              resolvedAdvance,
+              advanceDate || invoiceDate || toYMD(new Date()),
+              resolvedPaymentMethod,
+              resolvedBankAccountId,
+              advanceRows[0].id
+            ]
           );
         } else {
           await connection.query(
-            `INSERT INTO invoice_payments (invoice_id, amount, payment_date, notes) VALUES (?, ?, ?, 'Advance')`,
-            [invoiceId, resolvedAdvance, advanceDate || invoiceDate || toYMD(new Date())]
+            `INSERT INTO invoice_payments (invoice_id, amount, payment_date, notes, payment_method, bank_account_id)
+             VALUES (?, ?, ?, 'Advance', ?, ?)`,
+            [
+              invoiceId,
+              resolvedAdvance,
+              advanceDate || invoiceDate || toYMD(new Date()),
+              resolvedPaymentMethod,
+              resolvedBankAccountId
+            ]
           );
         }
       } else if (advanceRows.length > 0) {
