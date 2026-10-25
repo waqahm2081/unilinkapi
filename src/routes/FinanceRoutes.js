@@ -1718,7 +1718,7 @@ router.post('/finance/invoices', async (req, res) => {
       return res.status(500).json({
         success: false,
         message: 'Invoice amounts saved structure failed for advance/installments. Please open /finance/migrate once, then try again.',
-        detail: planErr.message      
+        detail: planErr.message
       });
     }
 
