@@ -1096,7 +1096,7 @@ router.get('/dashboard/stats', async (req, res) => {
       WHERE (l.is_registered = FALSE OR l.is_registered IS NULL)
     `);
     const [studentStats] = await pool.query(`SELECT COUNT(*) as total_students FROM users WHERE role = 'client'`);
-    const [applicationStats] = await pool.query(`SELECT COUNT(*) as active_applications FROM applications WHERE application_status NOT IN ('Closed', 'Rejected')`);
+    const [applicationStats] = await pool.query(`SELECT COUNT(*) as total_applications FROM applications`);
     const [visaStats] = await pool.query(`SELECT SUM(CASE WHEN visa_status = 'Pending' THEN 1 ELSE 0 END) as pending_visas, SUM(CASE WHEN visa_status = 'Approved' THEN 1 ELSE 0 END) as approved_visas FROM visas`);
     res.json({
       success: true,
@@ -1105,7 +1105,8 @@ router.get('/dashboard/stats', async (req, res) => {
         newLeads: Number(leadStats[0].new_leads) || 0,
         assignedLeads: Number(leadStats[0].assigned_leads) || 0,
         totalStudents: studentStats[0].total_students,
-        activeApplications: applicationStats[0].active_applications,
+        totalApplications: Number(applicationStats[0].total_applications) || 0,
+        activeApplications: Number(applicationStats[0].total_applications) || 0,
         pendingVisas: visaStats[0].pending_visas || 0,
         approvedVisas: visaStats[0].approved_visas || 0
       }
