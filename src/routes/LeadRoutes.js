@@ -893,20 +893,15 @@ router.get('/leads/:leadId/history', async (req, res) => {
   }
 });
 
-// Get all follow-up entries (one row per follow-up visit)
+// Get all follow-up entries (one row per follow-up visit).
+// Also includes each lead's initial form submission as follow-up #1
+// (same convention as Edit Lead / Edit Student history).
 router.get('/leads/followups', async (req, res) => {
   try {
     const view = req.query.view || 'active';
     const registrationFilter = getRegistrationFilter(view);
 
-    let followups;
-    try {
-      [followups] = await pool.query(
-        `SELECT fu.id as follow_up_id,
-                fu.follow_up_number,
-                fu.followed_up_at as last_follow_up,
-                fu.notes,
-                COALESCE(fu.purpose_of_visit, l.purpose_of_visit) as purpose_of_visit,
+    const leadCols = `
                 l.id,
                 l.full_name,
                 l.phone,
@@ -914,40 +909,69 @@ router.get('/leads/followups', async (req, res) => {
                 l.is_registered,
                 l.registered_at,
                 ${STUDENT_USER_ID_SQL} as student_user_id,
-                ${STUDENT_CODE_SQL} as student_code
-         FROM follow_ups fu
-         INNER JOIN leads l ON l.id = fu.lead_id
-         WHERE ${registrationFilter}
-         ORDER BY fu.followed_up_at DESC`
+                ${STUDENT_CODE_SQL} as student_code`;
+
+    // Synthetic row for the first meeting (lead form submission)
+    const initialSelect = `
+      SELECT CONCAT('initial-', l.id) as follow_up_id,
+             0 as follow_up_number,
+             l.created_at as last_follow_up,
+             l.counsellor_notes as notes,
+             CASE
+               WHEN (SELECT COUNT(*) FROM follow_ups fu0 WHERE fu0.lead_id = l.id) = 0
+               THEN COALESCE(l.purpose_of_visit, 'Initial lead form submission')
+               ELSE 'Initial lead form submission'
+             END as purpose_of_visit,
+             ${leadCols},
+             1 as is_initial
+      FROM leads l
+      WHERE ${registrationFilter}
+        AND l.created_at IS NOT NULL`;
+
+    let followups;
+    try {
+      [followups] = await pool.query(
+        `SELECT * FROM (
+           SELECT CAST(fu.id AS CHAR) as follow_up_id,
+                  fu.follow_up_number,
+                  fu.followed_up_at as last_follow_up,
+                  fu.notes,
+                  COALESCE(fu.purpose_of_visit, l.purpose_of_visit) as purpose_of_visit,
+                  ${leadCols},
+                  0 as is_initial
+           FROM follow_ups fu
+           INNER JOIN leads l ON l.id = fu.lead_id
+           WHERE ${registrationFilter}
+           UNION ALL
+           ${initialSelect}
+         ) AS all_followups
+         ORDER BY last_follow_up DESC`
       );
     } catch (queryErr) {
       // Fallback if follow_ups.purpose_of_visit column is not yet migrated
       if (queryErr.code !== 'ER_BAD_FIELD_ERROR') throw queryErr;
       [followups] = await pool.query(
-        `SELECT fu.id as follow_up_id,
-                fu.follow_up_number,
-                fu.followed_up_at as last_follow_up,
-                fu.notes,
-                l.purpose_of_visit as purpose_of_visit,
-                l.id,
-                l.full_name,
-                l.phone,
-                l.email,
-                l.is_registered,
-                l.registered_at,
-                ${STUDENT_USER_ID_SQL} as student_user_id,
-                ${STUDENT_CODE_SQL} as student_code
-         FROM follow_ups fu
-         INNER JOIN leads l ON l.id = fu.lead_id
-         WHERE ${registrationFilter}
-         ORDER BY fu.followed_up_at DESC`
+        `SELECT * FROM (
+           SELECT CAST(fu.id AS CHAR) as follow_up_id,
+                  fu.follow_up_number,
+                  fu.followed_up_at as last_follow_up,
+                  fu.notes,
+                  l.purpose_of_visit as purpose_of_visit,
+                  ${leadCols},
+                  0 as is_initial
+           FROM follow_ups fu
+           INNER JOIN leads l ON l.id = fu.lead_id
+           WHERE ${registrationFilter}
+           UNION ALL
+           ${initialSelect}
+         ) AS all_followups
+         ORDER BY last_follow_up DESC`
       );
     }
 
     const [registeredCountRows] = await pool.query(
-      `SELECT COUNT(DISTINCT l.id) as total
+      `SELECT COUNT(*) as total
        FROM leads l
-       INNER JOIN follow_ups fu ON l.id = fu.lead_id
        WHERE l.is_registered = TRUE`
     );
 
