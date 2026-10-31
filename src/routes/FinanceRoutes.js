@@ -421,23 +421,126 @@ const saveInvoiceInstallmentPlan = async (connection, invoiceId, {
   }
 };
 
+/** Sync invoices.advance_amount from all payments marked as Advance. */
+const syncAdvanceAmountFromPayments = async (connection, invoiceId) => {
+  const [rows] = await connection.query(
+    `SELECT COALESCE(SUM(amount), 0) AS advance_total
+     FROM invoice_payments
+     WHERE invoice_id = ? AND LOWER(TRIM(COALESCE(notes, ''))) = 'advance'`,
+    [invoiceId]
+  );
+  const advanceTotal = Math.max(0, parseFloat(rows[0]?.advance_total) || 0);
+  await connection.query(
+    'UPDATE invoices SET advance_amount = ? WHERE id = ?',
+    [advanceTotal, invoiceId]
+  );
+  return advanceTotal;
+};
+
+/**
+ * When advance changes, redistribute remaining balance (final - advance)
+ * equally across existing installment rows (keeps due dates / count).
+ * Advance must NEVER be applied as partial payment on an installment.
+ */
+const redistributeInstallmentsAfterAdvance = async (connection, invoiceId) => {
+  try {
+    await ensureInvoiceInstallmentSchema(connection);
+    const [invRows] = await connection.query(
+      'SELECT final_amount, advance_amount, has_installment_plan FROM invoices WHERE id = ?',
+      [invoiceId]
+    );
+    if (!invRows.length) return;
+
+    const installments = await fetchInvoiceInstallments(connection, invoiceId);
+    if (!installments.length) return;
+
+    // Ensure flag stays on if installment rows exist
+    if (!invRows[0].has_installment_plan) {
+      await connection.query(
+        'UPDATE invoices SET has_installment_plan = 1 WHERE id = ?',
+        [invoiceId]
+      );
+    }
+
+    const finalAmt = parseFloat(invRows[0].final_amount) || 0;
+    const advance = parseFloat(invRows[0].advance_amount) || 0;
+    const remaining = Math.max(0, Math.round((finalAmt - advance) * 100) / 100);
+    const count = installments.length;
+    const base = Math.floor((remaining / count) * 100) / 100;
+    let allocated = 0;
+
+    for (let i = 0; i < count; i += 1) {
+      const amount = i === count - 1
+        ? Math.round((remaining - allocated) * 100) / 100
+        : base;
+      allocated = Math.round((allocated + amount) * 100) / 100;
+      await connection.query(
+        `UPDATE invoice_installments
+         SET amount = ?, paid_amount = 0, status = 'Pending'
+         WHERE id = ?`,
+        [amount, installments[i].id]
+      );
+    }
+  } catch (err) {
+    console.warn('redistributeInstallmentsAfterAdvance:', err.message);
+  }
+};
+
+/** True when installment amounts do not match (final - advance). */
+const installmentPlanNeedsRedistribute = (finalAmount, advanceAmount, installments) => {
+  if (!installments?.length) return false;
+  const remaining = Math.max(0, Math.round((finalAmount - advanceAmount) * 100) / 100);
+  const sum = Math.round(
+    installments.reduce((s, row) => s + (parseFloat(row.amount) || 0), 0) * 100
+  ) / 100;
+  return Math.abs(sum - remaining) > 0.5;
+};
+
 /** Allocate payments beyond the advance toward planned installments (in order). */
 const allocatePaymentsToInstallments = async (connection, invoiceId) => {
   try {
     await ensureInvoiceInstallmentSchema(connection);
     const [invRows] = await connection.query(
-      'SELECT advance_amount, has_installment_plan FROM invoices WHERE id = ?',
+      'SELECT advance_amount, has_installment_plan, final_amount FROM invoices WHERE id = ?',
       [invoiceId]
     );
-    if (!invRows.length || !invRows[0].has_installment_plan) return;
-
-    const advance = parseFloat(invRows[0].advance_amount) || 0;
-    const payments = await fetchInvoicePayments(connection, invoiceId);
-    const totalPaid = payments.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
-    let remaining = Math.max(0, Math.round((totalPaid - advance) * 100) / 100);
+    if (!invRows.length) return;
 
     const installments = await fetchInvoiceInstallments(connection, invoiceId);
-    for (const inst of installments) {
+    if (!installments.length) return;
+
+    const payments = await fetchInvoicePayments(connection, invoiceId);
+    const advanceFromPayments = payments
+      .filter((p) => String(p.notes || '').trim().toLowerCase() === 'advance')
+      .reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
+    const advance = Math.max(
+      parseFloat(invRows[0].advance_amount) || 0,
+      advanceFromPayments
+    );
+
+    // Keep invoice.advance_amount in sync so UI matches allocation
+    if (Math.abs((parseFloat(invRows[0].advance_amount) || 0) - advance) > 0.001) {
+      await connection.query(
+        'UPDATE invoices SET advance_amount = ?, has_installment_plan = 1 WHERE id = ?',
+        [advance, invoiceId]
+      );
+    }
+
+    const finalAmt = parseFloat(invRows[0].final_amount) || 0;
+    if (installmentPlanNeedsRedistribute(finalAmt, advance, installments)) {
+      await connection.query(
+        'UPDATE invoices SET advance_amount = ? WHERE id = ?',
+        [advance, invoiceId]
+      );
+      await redistributeInstallmentsAfterAdvance(connection, invoiceId);
+    }
+
+    const freshInstallments = await fetchInvoiceInstallments(connection, invoiceId);
+    const totalPaid = payments.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
+    // Only non-advance payments apply to installments
+    let remaining = Math.max(0, Math.round((totalPaid - advance) * 100) / 100);
+
+    for (const inst of freshInstallments) {
       const due = parseFloat(inst.amount) || 0;
       const paidToward = Math.min(due, remaining);
       remaining = Math.round((remaining - paidToward) * 100) / 100;
@@ -455,6 +558,7 @@ const allocatePaymentsToInstallments = async (connection, invoiceId) => {
 };
 
 const recomputeInvoicePaymentTotals = async (connection, invoiceId, statusOverride = null) => {
+  await ensureInvoiceInstallmentSchema(connection);
   const [invRows] = await connection.query(
     'SELECT final_amount FROM invoices WHERE id = ?',
     [invoiceId]
@@ -487,6 +591,9 @@ const recomputeInvoicePaymentTotals = async (connection, invoiceId, statusOverri
     [totalPaid, lastDate, paymentStatus, invoiceId]
   );
   await syncLeadPaymentStatus(connection, invoiceId, paymentStatus);
+
+  // Always sync advance from payment notes, then rebalance / allocate installments
+  await syncAdvanceAmountFromPayments(connection, invoiceId);
   await allocatePaymentsToInstallments(connection, invoiceId);
 
   return { totalPaid, lastDate, paymentStatus };
@@ -1479,13 +1586,32 @@ router.get('/finance/invoices/:invoiceId', async (req, res) => {
       }
     }
 
+    // Repair stale installment amounts if advance payments exist but plan wasn't rebalanced
+    try {
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
+        await syncAdvanceAmountFromPayments(connection, invoiceId);
+        await allocatePaymentsToInstallments(connection, invoiceId);
+        await connection.commit();
+      } catch (repairErr) {
+        await connection.rollback();
+        console.warn('invoice advance/installment repair:', repairErr.message);
+      } finally {
+        connection.release();
+      }
+    } catch (repairOuterErr) {
+      console.warn('invoice repair skipped:', repairOuterErr.message);
+    }
+
+    const [freshInvoices] = await pool.query('SELECT * FROM invoices WHERE id = ?', [invoiceId]);
     const payments = await fetchInvoicePayments(pool, invoiceId);
     const installments = await fetchInvoiceInstallments(pool, invoiceId);
     const countryPrices = await fetchInvoiceCountryPrices(pool, invoiceId);
 
     res.json({
       success: true,
-      invoice: invoices[0],
+      invoice: freshInvoices[0] || invoices[0],
       extraServices,
       countryServices,
       agentStudents,
@@ -1509,12 +1635,16 @@ router.post('/finance/invoices/:invoiceId/payments', async (req, res) => {
   const connection = await pool.getConnection();
   try {
     await ensureInvoicePaymentsMethodSchema();
+    await ensureInvoiceInstallmentSchema(connection);
     await connection.beginTransaction();
     const { invoiceId } = req.params;
-    const { amount, paymentDate, notes, paymentStatus, paymentMethod, bankAccountId } = req.body;
+    const {
+      amount, paymentDate, notes, paymentStatus, paymentMethod, bankAccountId,
+      asAdvance, paymentType,
+    } = req.body;
 
     const [existing] = await connection.query(
-      'SELECT id, final_amount, paid_amount FROM invoices WHERE id = ?',
+      'SELECT id, final_amount, paid_amount, has_installment_plan, advance_amount FROM invoices WHERE id = ?',
       [invoiceId]
     );
     if (existing.length === 0) {
@@ -1533,13 +1663,31 @@ router.post('/finance/invoices/:invoiceId/payments', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Payment date is required' });
     }
 
+    const treatAsAdvance = asAdvance === true
+      || asAdvance === 1
+      || asAdvance === '1'
+      || String(paymentType || '').toLowerCase() === 'advance'
+      || String(notes || '').trim().toLowerCase() === 'advance';
+
     let methodFields;
     try {
-      methodFields = await resolvePaymentMethodFields(connection, paymentMethod, bankAccountId, { required: true });
+      // Allow cash default when method omitted (e.g. lead payment modal)
+      const methodRequired = paymentMethod != null && paymentMethod !== '';
+      methodFields = await resolvePaymentMethodFields(
+        connection,
+        paymentMethod || 'cash',
+        bankAccountId,
+        { required: methodRequired || paymentMethod === 'bank' }
+      );
+      if (!methodRequired && (paymentMethod == null || paymentMethod === '')) {
+        methodFields = { paymentMethod: 'cash', bankAccountId: null };
+      }
     } catch (err) {
       await connection.rollback();
       return res.status(err.status || 400).json({ success: false, message: err.message });
     }
+
+    const paymentNotes = treatAsAdvance ? 'Advance' : (notes?.trim() || null);
 
     const [insertResult] = await connection.query(
       `INSERT INTO invoice_payments (invoice_id, amount, payment_date, notes, payment_method, bank_account_id)
@@ -1548,7 +1696,7 @@ router.post('/finance/invoices/:invoiceId/payments', async (req, res) => {
         invoiceId,
         paymentAmount,
         paymentDate,
-        notes?.trim() || null,
+        paymentNotes,
         methodFields.paymentMethod,
         methodFields.bankAccountId
       ]
@@ -1560,6 +1708,11 @@ router.post('/finance/invoices/:invoiceId/payments', async (req, res) => {
       [methodFields.paymentMethod, methodFields.bankAccountId, invoiceId]
     );
 
+    if (treatAsAdvance) {
+      await syncAdvanceAmountFromPayments(connection, invoiceId);
+      await redistributeInstallmentsAfterAdvance(connection, invoiceId);
+    }
+
     const totals = await recomputeInvoicePaymentTotals(
       connection,
       invoiceId,
@@ -1567,15 +1720,26 @@ router.post('/finance/invoices/:invoiceId/payments', async (req, res) => {
     );
 
     const payments = await fetchInvoicePayments(connection, invoiceId);
+    const installments = await fetchInvoiceInstallments(connection, invoiceId);
+    const [invFresh] = await connection.query(
+      'SELECT advance_amount, has_installment_plan, paid_amount, payment_status, final_amount FROM invoices WHERE id = ?',
+      [invoiceId]
+    );
     await connection.commit();
 
     res.status(201).json({
       success: true,
-      message: 'Payment recorded successfully',
+      message: treatAsAdvance
+        ? 'Advance payment recorded successfully'
+        : 'Payment recorded successfully',
       paymentId: insertResult.insertId,
-      paymentStatus: totals?.paymentStatus,
-      paidAmount: totals?.totalPaid,
-      payments
+      paymentStatus: totals?.paymentStatus || invFresh[0]?.payment_status,
+      paidAmount: totals?.totalPaid ?? invFresh[0]?.paid_amount,
+      advanceAmount: invFresh[0]?.advance_amount,
+      hasInstallmentPlan: !!(invFresh[0]?.has_installment_plan),
+      payments,
+      installments,
+      asAdvance: treatAsAdvance,
     });
   } catch (error) {
     await connection.rollback();
