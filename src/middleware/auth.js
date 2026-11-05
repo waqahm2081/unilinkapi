@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+// Must match auth.js / StaffRoutes / PortalRoutes fallback when JWT_SECRET env is unset
+const JWT_SECRET = process.env.JWT_SECRET || 'fgkjdfg890780we9fjsdkjsdyw39%^sdffsdfsddf';
 
 // Middleware to verify JWT token
 export const authenticateToken = (req, res, next) => {

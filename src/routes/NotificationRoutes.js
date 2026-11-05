@@ -22,7 +22,8 @@ function currentUserId(req) {
 
 // Use /admin-alerts (not /notifications) — many ad blockers silently block "notifications" URLs.
 
-router.get('/admin-alerts/vapid-public-key', ...adminOnly, async (req, res) => {
+// Public key is not secret — keep unauthenticated so subscribe can start even before role checks
+router.get('/admin-alerts/vapid-public-key', async (req, res) => {
   try {
     await ensureNotificationSchema();
     res.json({ success: true, publicKey: vapidPublicKey });
