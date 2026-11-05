@@ -19,6 +19,7 @@ import employees from './routes/employees.js';
 import expenses from './routes/expenses.js';
 import meetingsRouter from './routes/meetings.js';
 import portalRoutes from './routes/PortalRoutes.js';
+import notificationRoutes from './routes/NotificationRoutes.js';
 
 const app = express();
 
@@ -68,6 +69,7 @@ app.use('/', employees);
 app.use('/', expenses);
 app.use('/', meetingsRouter);
 app.use('/', portalRoutes);
+app.use('/', notificationRoutes);
 
 // Health check
 app.get('/health', (req, res) => {

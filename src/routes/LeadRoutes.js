@@ -8,6 +8,7 @@ import pool, { ensureSchemaMigrations } from '../config/db.js';
 import { claimStudentRegistrationId } from '../utils/studentRegistrationId.js';
 import { qualificationsToEducationRows } from '../utils/qualificationsToEducation.js';
 import { ensureUploadSubdir } from '../config/uploads.js';
+import { notifyAdminsOfNewLead } from '../services/notificationService.js';
 
 const router = express.Router();
 
@@ -503,11 +504,20 @@ router.post('/leads', async (req, res) => {
     }
     
     await connection.commit();
+
+    const leadId = result.insertId;
+
+    // Notify admins (in-app + push) without blocking the lead response
+    notifyAdminsOfNewLead({
+      leadId,
+      fullName: trimmedName,
+      email: trimmedEmail,
+    }).catch((err) => console.error('Failed to notify admins of new lead:', err));
     
     res.status(201).json({
       success: true,
       message: 'Your Form has been submitted successfully!',
-      leadId: result.insertId
+      leadId
     });
     
   } catch (error) {
