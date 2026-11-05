@@ -13,7 +13,7 @@ import {
 
 const router = express.Router();
 
-const adminOnly = [authenticateToken, authorizeRoles('admin')];
+const alertUsers = [authenticateToken, authorizeRoles('admin', 'counselor')];
 
 /** Prefer userId from JWT; fall back to id if present. */
 function currentUserId(req) {
@@ -33,7 +33,7 @@ router.get('/admin-alerts/vapid-public-key', async (req, res) => {
   }
 });
 
-router.get('/admin-alerts/unread-count', ...adminOnly, async (req, res) => {
+router.get('/admin-alerts/unread-count', ...alertUsers, async (req, res) => {
   try {
     const unreadCount = await getUnreadCount(currentUserId(req));
     res.json({ success: true, unreadCount });
@@ -44,7 +44,7 @@ router.get('/admin-alerts/unread-count', ...adminOnly, async (req, res) => {
 });
 
 /** SSE stream for live unread updates (no page refresh). */
-router.get('/admin-alerts/stream', ...adminOnly, async (req, res) => {
+router.get('/admin-alerts/stream', ...alertUsers, async (req, res) => {
   try {
     await ensureNotificationSchema();
   } catch (error) {
@@ -85,7 +85,7 @@ router.get('/admin-alerts/stream', ...adminOnly, async (req, res) => {
   });
 });
 
-router.get('/admin-alerts', ...adminOnly, async (req, res) => {
+router.get('/admin-alerts', ...alertUsers, async (req, res) => {
   try {
     const filter = String(req.query.filter || 'all').toLowerCase();
     const limit = req.query.limit;
@@ -99,7 +99,7 @@ router.get('/admin-alerts', ...adminOnly, async (req, res) => {
   }
 });
 
-router.post('/admin-alerts/read-all', ...adminOnly, async (req, res) => {
+router.post('/admin-alerts/read-all', ...alertUsers, async (req, res) => {
   try {
     const updated = await markAllNotificationsRead(currentUserId(req));
     res.json({ success: true, updated, unreadCount: 0 });
@@ -109,7 +109,7 @@ router.post('/admin-alerts/read-all', ...adminOnly, async (req, res) => {
   }
 });
 
-router.post('/admin-alerts/:id/read', ...adminOnly, async (req, res) => {
+router.post('/admin-alerts/:id/read', ...alertUsers, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!id) {
@@ -125,7 +125,7 @@ router.post('/admin-alerts/:id/read', ...adminOnly, async (req, res) => {
   }
 });
 
-router.post('/admin-alerts/push-subscribe', ...adminOnly, async (req, res) => {
+router.post('/admin-alerts/push-subscribe', ...alertUsers, async (req, res) => {
   try {
     const subscription = req.body?.subscription || req.body;
     await savePushSubscription(currentUserId(req), subscription);
@@ -136,7 +136,7 @@ router.post('/admin-alerts/push-subscribe', ...adminOnly, async (req, res) => {
   }
 });
 
-router.post('/admin-alerts/push-unsubscribe', ...adminOnly, async (req, res) => {
+router.post('/admin-alerts/push-unsubscribe', ...alertUsers, async (req, res) => {
   try {
     const endpoint = req.body?.endpoint || req.body?.subscription?.endpoint;
     await removePushSubscription(currentUserId(req), endpoint);

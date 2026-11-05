@@ -42,63 +42,179 @@ export async function getAdminUserIds() {
   return rows.map((r) => r.id);
 }
 
+function frontendOrigin() {
+  return (
+    process.env.FRONTEND_URL ||
+    (process.env.NODE_ENV === 'production'
+      ? 'https://unilinkweb.cyb360.com'
+      : 'http://localhost:3000')
+  ).replace(/\/$/, '');
+}
+
+/** Resolve login user id linked to a counselors.id profile. */
+export async function getLoginUserIdForCounselorProfile(counselorProfileId) {
+  if (!counselorProfileId) return null;
+  const [rows] = await pool.query(
+    `SELECT COALESCE(c.user_id, u.id) AS user_id
+     FROM counselors c
+     LEFT JOIN users u
+       ON u.role = 'counselor' AND LOWER(u.email) = LOWER(c.email)
+     WHERE c.id = ?
+     LIMIT 1`,
+    [counselorProfileId]
+  );
+  const userId = rows[0]?.user_id;
+  return userId ? Number(userId) : null;
+}
+
+/**
+ * Create in-app + push notifications for a list of user ids.
+ */
+export async function notifyUsers({
+  userIds,
+  type,
+  title,
+  body,
+  link,
+  data = {},
+  tag,
+  actions = [
+    { action: 'view', title: 'View' },
+    { action: 'dismiss', title: 'Dismiss' },
+  ],
+}) {
+  await ensureNotificationSchema();
+  const ids = [...new Set((userIds || []).map(Number).filter((id) => Number.isFinite(id) && id > 0))];
+  if (!ids.length) return;
+
+  const iconUrl = `${frontendOrigin()}/images/logo.webp`;
+  const payloadData = { ...data, type, url: link };
+
+  for (const userId of ids) {
+    const [result] = await pool.query(
+      `INSERT INTO notifications (user_id, type, title, body, link, data, is_read)
+       VALUES (?, ?, ?, ?, ?, ?, 0)`,
+      [userId, type, title, body, link || null, JSON.stringify(payloadData)]
+    );
+    await sendPushToUser(userId, {
+      title,
+      body,
+      icon: iconUrl,
+      badge: iconUrl,
+      tag: tag || `${type}-${userId}-${Date.now()}`,
+      data: {
+        ...payloadData,
+        notificationId: result.insertId,
+      },
+      actions,
+    });
+  }
+}
+
 /**
  * Create in-app notifications for all admins and send web push.
  */
 export async function notifyAdminsOfNewLead({ leadId, fullName, email }) {
-  await ensureNotificationSchema();
-
   const adminIds = await getAdminUserIds();
   if (!adminIds.length) {
     console.warn('notifyAdminsOfNewLead: no admin users found');
     return;
   }
 
-  const title = 'New Lead Submitted';
-  const body = `${fullName || 'A student'} submitted a new lead form${email ? ` (${email})` : ''}`;
-  const link = `/edit-lead/${leadId}`;
-  const data = { leadId, fullName, email, type: 'new_lead' };
+  await notifyUsers({
+    userIds: adminIds,
+    type: 'new_lead',
+    title: 'New Lead Submitted',
+    body: `${fullName || 'A student'} submitted a new lead form${email ? ` (${email})` : ''}`,
+    link: `/edit-lead/${leadId}`,
+    data: { leadId, fullName, email },
+    tag: `new-lead-${leadId}`,
+    actions: [
+      { action: 'view', title: 'View Lead' },
+      { action: 'dismiss', title: 'Dismiss' },
+    ],
+  });
+}
 
-  const notificationIdsByUser = new Map();
-
-  for (const userId of adminIds) {
-    const [result] = await pool.query(
-      `INSERT INTO notifications (user_id, type, title, body, link, data, is_read)
-       VALUES (?, 'new_lead', ?, ?, ?, ?, 0)`,
-      [userId, title, body, link, JSON.stringify(data)]
-    );
-    notificationIdsByUser.set(userId, result.insertId);
+export async function notifyCounselorLeadAssigned({
+  counselorProfileId,
+  leadId,
+  leadName,
+  leadEmail,
+}) {
+  const userId = await getLoginUserIdForCounselorProfile(counselorProfileId);
+  if (!userId) {
+    console.warn('notifyCounselorLeadAssigned: no login user for counselor', counselorProfileId);
+    return;
   }
+  await notifyUsers({
+    userIds: [userId],
+    type: 'lead_assigned',
+    title: 'New Lead Assigned',
+    body: `${leadName || 'A lead'} was assigned to you${leadEmail ? ` (${leadEmail})` : ''}`,
+    link: `/edit-lead/${leadId}`,
+    data: { leadId, counselorProfileId, leadName, leadEmail },
+    tag: `lead-assigned-${leadId}-${counselorProfileId}`,
+    actions: [
+      { action: 'view', title: 'View Lead' },
+      { action: 'dismiss', title: 'Dismiss' },
+    ],
+  });
+}
 
-  const frontendOrigin = (
-    process.env.FRONTEND_URL ||
-    (process.env.NODE_ENV === 'production'
-      ? 'https://unilinkweb.cyb360.com'
-      : 'http://localhost:3000')
-  ).replace(/\/$/, '');
-  const iconUrl = `${frontendOrigin}/images/logo.webp`;
-
-  // Push to all admin subscriptions (best-effort)
-  for (const userId of adminIds) {
-    const notificationId = notificationIdsByUser.get(userId);
-    await sendPushToUser(userId, {
-      title,
-      body,
-      icon: iconUrl,
-      badge: iconUrl,
-      tag: `new-lead-${leadId}`,
-      data: {
-        url: link,
-        notificationId,
-        leadId,
-        type: 'new_lead',
-      },
-      actions: [
-        { action: 'view', title: 'View Lead' },
-        { action: 'dismiss', title: 'Dismiss' },
-      ],
-    });
+export async function notifyCounselorStudentAssigned({
+  counselorProfileId,
+  studentId,
+  studentName,
+  studentEmail,
+}) {
+  const userId = await getLoginUserIdForCounselorProfile(counselorProfileId);
+  if (!userId) {
+    console.warn('notifyCounselorStudentAssigned: no login user for counselor', counselorProfileId);
+    return;
   }
+  await notifyUsers({
+    userIds: [userId],
+    type: 'student_assigned',
+    title: 'New Student Assigned',
+    body: `${studentName || 'A student'} was assigned to you${studentEmail ? ` (${studentEmail})` : ''}`,
+    link: `/edit-student/${studentId}`,
+    data: { studentId, counselorProfileId, studentName, studentEmail },
+    tag: `student-assigned-${studentId}-${counselorProfileId}`,
+    actions: [
+      { action: 'view', title: 'View Student' },
+      { action: 'dismiss', title: 'Dismiss' },
+    ],
+  });
+}
+
+export async function notifyCounselorsLeadRegistered({
+  counselorProfileIds,
+  leadId,
+  studentId,
+  studentName,
+  studentEmail,
+}) {
+  const userIds = [];
+  for (const counselorProfileId of counselorProfileIds || []) {
+    const userId = await getLoginUserIdForCounselorProfile(counselorProfileId);
+    if (userId) userIds.push(userId);
+  }
+  if (!userIds.length) return;
+
+  await notifyUsers({
+    userIds,
+    type: 'lead_registered',
+    title: 'Lead Registered as Student',
+    body: `${studentName || 'Your assigned lead'} has been registered as a student${studentEmail ? ` (${studentEmail})` : ''}`,
+    link: studentId ? `/edit-student/${studentId}` : `/edit-lead/${leadId}`,
+    data: { leadId, studentId, studentName, studentEmail },
+    tag: `lead-registered-${leadId}`,
+    actions: [
+      { action: 'view', title: 'View Student' },
+      { action: 'dismiss', title: 'Dismiss' },
+    ],
+  });
 }
 
 export async function sendPushToUser(userId, payload) {

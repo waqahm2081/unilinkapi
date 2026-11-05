@@ -8,7 +8,11 @@ import pool, { ensureSchemaMigrations } from '../config/db.js';
 import { claimStudentRegistrationId } from '../utils/studentRegistrationId.js';
 import { qualificationsToEducationRows } from '../utils/qualificationsToEducation.js';
 import { ensureUploadSubdir } from '../config/uploads.js';
-import { notifyAdminsOfNewLead } from '../services/notificationService.js';
+import {
+  notifyAdminsOfNewLead,
+  notifyCounselorLeadAssigned,
+  notifyCounselorsLeadRegistered,
+} from '../services/notificationService.js';
 import { optionalAuthenticate } from '../middleware/auth.js';
 import { getCounselorProfileId } from '../utils/counselorAccess.js';
 
@@ -1696,6 +1700,18 @@ router.post('/leads/:leadId/register-student', async (req, res) => {
     );
 
     await connection.commit();
+
+    if (assignedCounselors.length > 0) {
+      notifyCounselorsLeadRegistered({
+        counselorProfileIds: assignedCounselors.map((c) => c.counselor_id),
+        leadId: Number(leadId),
+        studentId: userId,
+        studentName: [mergedInfo.name, mergedInfo.middle_name, mergedInfo.surname].filter(Boolean).join(' ')
+          || lead.full_name,
+        studentEmail: registrationEmail || lead.email,
+      }).catch((err) => console.error('Failed to notify counselors of lead registration:', err));
+    }
+
     res.json({
       success: true,
       message: 'Lead successfully registered as student',
@@ -1768,7 +1784,21 @@ router.post('/leads/:leadId/assign-counselor', async (req, res) => {
       'INSERT INTO lead_counselor_assignments (lead_id, counselor_id, notes) VALUES (?, ?, ?)',
       [leadId, counselorId, notes || null]
     );
+
+    const [leadInfo] = await connection.query(
+      'SELECT id, full_name, email FROM leads WHERE id = ?',
+      [leadId]
+    );
+
     await connection.commit();
+
+    notifyCounselorLeadAssigned({
+      counselorProfileId: counselorId,
+      leadId: Number(leadId),
+      leadName: leadInfo[0]?.full_name,
+      leadEmail: leadInfo[0]?.email,
+    }).catch((err) => console.error('Failed to notify counselor of lead assignment:', err));
+
     res.json({ success: true, message: 'Counselor assigned successfully' });
   } catch (error) {
     await connection.rollback();

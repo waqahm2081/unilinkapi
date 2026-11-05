@@ -13,6 +13,7 @@ import {
 } from '../utils/transferStudentDocsToApplication.js';
 import { optionalAuthenticate } from '../middleware/auth.js';
 import { getCounselorProfileId } from '../utils/counselorAccess.js';
+import { notifyCounselorStudentAssigned } from '../services/notificationService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -985,8 +986,16 @@ router.put('/students/:studentId', async (req, res) => {
     await saveIntendedPrograms(connection, studentId, intendedPrograms);
     await saveStudentNotes(connection, studentId, notes);
 
+    let newlyAssignedCounselorIds = [];
     if (Array.isArray(counselorIds)) {
       const uniqueIds = [...new Set(counselorIds.map(id => Number(id)).filter(id => Number.isFinite(id) && id > 0))];
+      const [previous] = await connection.query(
+        'SELECT counselor_id FROM student_counselors WHERE user_id = ?',
+        [studentId]
+      );
+      const previousSet = new Set(previous.map((r) => Number(r.counselor_id)));
+      newlyAssignedCounselorIds = uniqueIds.filter((id) => !previousSet.has(id));
+
       await connection.query('DELETE FROM student_counselors WHERE user_id = ?', [studentId]);
       for (const counselorId of uniqueIds) {
         await connection.query(
@@ -997,6 +1006,26 @@ router.put('/students/:studentId', async (req, res) => {
     }
 
     await connection.commit();
+
+    if (newlyAssignedCounselorIds.length) {
+      const [studentRows] = await pool.query(
+        `SELECT id, name, middle_name, surname, email FROM users WHERE id = ? AND role = 'client'`,
+        [studentId]
+      );
+      const s = studentRows[0];
+      const studentName = s
+        ? [s.name, s.middle_name, s.surname].filter(Boolean).join(' ')
+        : 'A student';
+      for (const counselorId of newlyAssignedCounselorIds) {
+        notifyCounselorStudentAssigned({
+          counselorProfileId: counselorId,
+          studentId: Number(studentId),
+          studentName,
+          studentEmail: s?.email,
+        }).catch((err) => console.error('Failed to notify counselor of student assignment:', err));
+      }
+    }
+
     res.json({ success: true, message: 'Student updated successfully' });
 
   } catch (error) {
@@ -1370,7 +1399,23 @@ router.post('/students/:studentId/assign-counselor', async (req, res) => {
       'INSERT INTO student_counselors (user_id, counselor_id) VALUES (?, ?)', [studentId, counselorId]
     );
 
+    const [studentRows] = await connection.query(
+      `SELECT id, name, middle_name, surname, email FROM users WHERE id = ? AND role = 'client'`,
+      [studentId]
+    );
+
     await connection.commit();
+
+    const s = studentRows[0];
+    notifyCounselorStudentAssigned({
+      counselorProfileId: counselorId,
+      studentId: Number(studentId),
+      studentName: s
+        ? [s.name, s.middle_name, s.surname].filter(Boolean).join(' ')
+        : 'A student',
+      studentEmail: s?.email,
+    }).catch((err) => console.error('Failed to notify counselor of student assignment:', err));
+
     res.json({ success: true, message: 'Counselor assigned successfully' });
 
   } catch (error) {
