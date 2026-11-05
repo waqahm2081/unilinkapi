@@ -8,6 +8,8 @@
 
 import express from 'express';
 import pool from '../config/db.js';
+import { optionalAuthenticate } from '../middleware/auth.js';
+import { getCounselorProfileId } from '../utils/counselorAccess.js';
 
 const router = express.Router();
 
@@ -36,9 +38,15 @@ const ensureCounselorChangeReasonColumn = async () => {
 // — where the meeting belongs to a student — the student's email.
 // Differentiates leads vs students via the presence of lead_id / user_id.
 // ─────────────────────────────────────────────────────────────────────────────
-router.get('/meetings/all', async (req, res) => {
+router.get('/meetings/all', optionalAuthenticate, async (req, res) => {
   try {
     await ensureCounselorChangeReasonColumn();
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const counselorFilter = counselorProfileId
+      ? 'WHERE cm.counselor_id = ?'
+      : '';
+    const params = counselorProfileId ? [counselorProfileId] : [];
+
     const [meetings] = await pool.query(
       `SELECT
          cm.id,
@@ -79,7 +87,9 @@ router.get('/meetings/all', async (req, res) => {
        LEFT JOIN leads l
          ON cm.lead_id = l.id
 
-       ORDER BY cm.meeting_date DESC, cm.meeting_time DESC`
+       ${counselorFilter}
+       ORDER BY cm.meeting_date DESC, cm.meeting_time DESC`,
+      params
     );
 
     // Normalise: for lead meetings student_email comes from lead_email

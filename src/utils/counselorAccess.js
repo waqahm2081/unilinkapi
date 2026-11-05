@@ -7,6 +7,8 @@ export const COUNSELOR_MODULES = [
   'students',
   'applications',
   'visas',
+  'finance',
+  'master_data',
 ];
 
 export function counselorPasswordFromName(name) {
