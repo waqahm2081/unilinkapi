@@ -1229,4 +1229,47 @@ router.get('/dashboard/recent-applications', optionalAuthenticate, async (req, r
   }
 });
 
+router.get('/dashboard/recent-leads', optionalAuthenticate, async (req, res) => {
+  try {
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const counselorFilter = counselorProfileId
+      ? `AND EXISTS (
+           SELECT 1 FROM lead_counselor_assignments lca_scope
+           WHERE lca_scope.lead_id = l.id AND lca_scope.counselor_id = ?
+         )`
+      : '';
+    const params = counselorProfileId ? [counselorProfileId] : [];
+
+    const [leads] = await pool.query(
+      `SELECT
+         l.id,
+         l.full_name,
+         l.email,
+         l.phone,
+         l.status,
+         l.interest,
+         l.program,
+         l.is_registered,
+         l.created_at,
+         GROUP_CONCAT(DISTINCT co.name ORDER BY co.name SEPARATOR ', ') AS counselor_names
+       FROM leads l
+       LEFT JOIN lead_counselor_assignments lca ON lca.lead_id = l.id
+       LEFT JOIN counselors co ON co.id = lca.counselor_id
+       WHERE 1=1
+         ${counselorFilter}
+       GROUP BY
+         l.id, l.full_name, l.email, l.phone, l.status, l.interest, l.program,
+         l.is_registered, l.created_at
+       ORDER BY l.created_at DESC
+       LIMIT 10`,
+      params
+    );
+
+    res.json({ success: true, leads });
+  } catch (error) {
+    console.error('Error fetching recent leads:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch recent leads' });
+  }
+});
+
 export default router;
