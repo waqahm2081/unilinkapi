@@ -15,7 +15,14 @@ const router = express.Router();
 
 const adminOnly = [authenticateToken, authorizeRoles('admin')];
 
-router.get('/notifications/vapid-public-key', ...adminOnly, async (req, res) => {
+/** Prefer userId from JWT; fall back to id if present. */
+function currentUserId(req) {
+  return Number(req.user?.userId ?? req.user?.id);
+}
+
+// Use /admin-alerts (not /notifications) — many ad blockers silently block "notifications" URLs.
+
+router.get('/admin-alerts/vapid-public-key', ...adminOnly, async (req, res) => {
   try {
     await ensureNotificationSchema();
     res.json({ success: true, publicKey: vapidPublicKey });
@@ -25,22 +32,9 @@ router.get('/notifications/vapid-public-key', ...adminOnly, async (req, res) => 
   }
 });
 
-router.get('/notifications', ...adminOnly, async (req, res) => {
+router.get('/admin-alerts/unread-count', ...adminOnly, async (req, res) => {
   try {
-    const filter = String(req.query.filter || 'all').toLowerCase();
-    const limit = req.query.limit;
-    const notifications = await listNotifications(req.user.userId, { filter, limit });
-    const unreadCount = await getUnreadCount(req.user.userId);
-    res.json({ success: true, notifications, unreadCount });
-  } catch (error) {
-    console.error('list notifications error:', error);
-    res.status(500).json({ success: false, message: 'Failed to load notifications' });
-  }
-});
-
-router.get('/notifications/unread-count', ...adminOnly, async (req, res) => {
-  try {
-    const unreadCount = await getUnreadCount(req.user.userId);
+    const unreadCount = await getUnreadCount(currentUserId(req));
     res.json({ success: true, unreadCount });
   } catch (error) {
     console.error('unread count error:', error);
@@ -49,19 +43,20 @@ router.get('/notifications/unread-count', ...adminOnly, async (req, res) => {
 });
 
 /** SSE stream for live unread updates (no page refresh). */
-router.get('/notifications/stream', ...adminOnly, async (req, res) => {
+router.get('/admin-alerts/stream', ...adminOnly, async (req, res) => {
   try {
     await ensureNotificationSchema();
   } catch (error) {
-    return res.status(500).json({ success: false, message: 'Failed to init notifications' });
+    return res.status(500).json({ success: false, message: 'Failed to init alerts' });
   }
 
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-  const userId = req.user.userId;
+  const userId = currentUserId(req);
   let lastCount = -1;
   let closed = false;
 
@@ -76,7 +71,7 @@ router.get('/notifications/stream', ...adminOnly, async (req, res) => {
         res.write(`: ping\n\n`);
       }
     } catch (err) {
-      console.warn('notification stream error:', err.message);
+      console.warn('alert stream error:', err.message);
     }
   };
 
@@ -89,24 +84,23 @@ router.get('/notifications/stream', ...adminOnly, async (req, res) => {
   });
 });
 
-router.post('/notifications/:id/read', ...adminOnly, async (req, res) => {
+router.get('/admin-alerts', ...adminOnly, async (req, res) => {
   try {
-    const id = Number(req.params.id);
-    if (!id) {
-      return res.status(400).json({ success: false, message: 'Invalid notification id' });
-    }
-    const ok = await markNotificationRead(req.user.userId, id);
-    const unreadCount = await getUnreadCount(req.user.userId);
-    res.json({ success: true, updated: ok, unreadCount });
+    const filter = String(req.query.filter || 'all').toLowerCase();
+    const limit = req.query.limit;
+    const userId = currentUserId(req);
+    const notifications = await listNotifications(userId, { filter, limit });
+    const unreadCount = await getUnreadCount(userId);
+    res.json({ success: true, notifications, unreadCount });
   } catch (error) {
-    console.error('mark read error:', error);
-    res.status(500).json({ success: false, message: 'Failed to mark as read' });
+    console.error('list alerts error:', error);
+    res.status(500).json({ success: false, message: 'Failed to load alerts' });
   }
 });
 
-router.post('/notifications/read-all', ...adminOnly, async (req, res) => {
+router.post('/admin-alerts/read-all', ...adminOnly, async (req, res) => {
   try {
-    const updated = await markAllNotificationsRead(req.user.userId);
+    const updated = await markAllNotificationsRead(currentUserId(req));
     res.json({ success: true, updated, unreadCount: 0 });
   } catch (error) {
     console.error('mark all read error:', error);
@@ -114,21 +108,37 @@ router.post('/notifications/read-all', ...adminOnly, async (req, res) => {
   }
 });
 
-router.post('/notifications/subscribe', ...adminOnly, async (req, res) => {
+router.post('/admin-alerts/:id/read', ...adminOnly, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) {
+      return res.status(400).json({ success: false, message: 'Invalid alert id' });
+    }
+    const userId = currentUserId(req);
+    const ok = await markNotificationRead(userId, id);
+    const unreadCount = await getUnreadCount(userId);
+    res.json({ success: true, updated: ok, unreadCount });
+  } catch (error) {
+    console.error('mark read error:', error);
+    res.status(500).json({ success: false, message: 'Failed to mark as read' });
+  }
+});
+
+router.post('/admin-alerts/push-subscribe', ...adminOnly, async (req, res) => {
   try {
     const subscription = req.body?.subscription || req.body;
-    await savePushSubscription(req.user.userId, subscription);
-    res.json({ success: true, message: 'Subscribed to push notifications' });
+    await savePushSubscription(currentUserId(req), subscription);
+    res.json({ success: true, message: 'Subscribed to push alerts' });
   } catch (error) {
     console.error('subscribe error:', error);
     res.status(400).json({ success: false, message: error.message || 'Failed to subscribe' });
   }
 });
 
-router.post('/notifications/unsubscribe', ...adminOnly, async (req, res) => {
+router.post('/admin-alerts/push-unsubscribe', ...adminOnly, async (req, res) => {
   try {
     const endpoint = req.body?.endpoint || req.body?.subscription?.endpoint;
-    await removePushSubscription(req.user.userId, endpoint);
+    await removePushSubscription(currentUserId(req), endpoint);
     res.json({ success: true, message: 'Unsubscribed' });
   } catch (error) {
     console.error('unsubscribe error:', error);
