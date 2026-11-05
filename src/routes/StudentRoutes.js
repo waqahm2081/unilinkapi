@@ -11,6 +11,8 @@ import {
   transferStudentDocsToApplication,
   cleanupCopiedFiles,
 } from '../utils/transferStudentDocsToApplication.js';
+import { optionalAuthenticate } from '../middleware/auth.js';
+import { getCounselorProfileId } from '../utils/counselorAccess.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -317,8 +319,17 @@ const generatePassword = (length = 12) => {
 // ============ STUDENT CRUD ENDPOINTS ============
 
 // Get all students
-router.get('/students', async (req, res) => {
+router.get('/students', optionalAuthenticate, async (req, res) => {
   try {
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const counselorFilter = counselorProfileId
+      ? `AND EXISTS (
+           SELECT 1 FROM student_counselors sc_scope
+           WHERE sc_scope.user_id = u.id AND sc_scope.counselor_id = ?
+         )`
+      : '';
+    const params = counselorProfileId ? [counselorProfileId] : [];
+
     const [students] = await pool.query(
       `SELECT u.id, u.student_id, u.name, u.middle_name, u.surname, u.email, 
         u.mobile, u.country, u.dob, u.status, u.course, u.created_at,
@@ -328,8 +339,10 @@ router.get('/students', async (req, res) => {
       LEFT JOIN student_counselors sc ON u.id = sc.user_id
       LEFT JOIN counselor_meetings cm ON u.id = cm.user_id
       WHERE u.role = 'client'
+        ${counselorFilter}
       GROUP BY u.id
-      ORDER BY u.created_at DESC`
+      ORDER BY u.created_at DESC`,
+      params
     );
     res.json({ success: true, students, total: students.length });
   } catch (error) {
@@ -373,10 +386,21 @@ router.get('/students/:studentId/credentials', async (req, res) => {
 });
 
 // Get single student by ID with all details
-router.get('/students/:studentId', async (req, res) => {
+router.get('/students/:studentId', optionalAuthenticate, async (req, res) => {
   try {
     await ensureIntendedProgramSchema();
     const { studentId } = req.params;
+
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    if (counselorProfileId) {
+      const [assigned] = await pool.query(
+        'SELECT id FROM student_counselors WHERE user_id = ? AND counselor_id = ? LIMIT 1',
+        [studentId, counselorProfileId]
+      );
+      if (!assigned.length) {
+        return res.status(403).json({ success: false, message: 'Access denied for this student' });
+      }
+    }
 
     const [students] = await pool.query(
       `SELECT * FROM users WHERE id = ? AND role = 'client'`,

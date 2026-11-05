@@ -1,5 +1,9 @@
 import express from 'express';
 import pool from '../config/db.js';
+import {
+  createOrUpdateCounselorUser,
+  ensureCounselorUserLinkSchema,
+} from '../utils/counselorAccess.js';
 
 const router = express.Router();
 
@@ -207,12 +211,32 @@ router.post('/counselors', async (req, res) => {
     // Generate counselor ID
     const counselorId = await generateCounselorId(connection);
     
+    await ensureCounselorUserLinkSchema();
+
+    // Create login account (password = firstName + "123@")
+    const { userId: linkedUserId, plain, skippedRoleChange } = await createOrUpdateCounselorUser({
+      name: trimmedName,
+      email: trimmedEmail,
+      connection,
+      resetPassword: true,
+    });
+
     // Insert counselor
-    const [result] = await connection.query(
-      `INSERT INTO counselors (counselor_id, name, email, phone, experience, expertise, status, number_of_students)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-      [counselorId, trimmedName, trimmedEmail, trimmedPhone, experience.trim(), expertise.trim(), status || 'Active']
-    );
+    let result;
+    try {
+      [result] = await connection.query(
+        `INSERT INTO counselors (counselor_id, name, email, phone, experience, expertise, status, number_of_students, user_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+        [counselorId, trimmedName, trimmedEmail, trimmedPhone, experience.trim(), expertise.trim(), status || 'Active', linkedUserId || null]
+      );
+    } catch (insertErr) {
+      if (insertErr.code !== 'ER_BAD_FIELD_ERROR') throw insertErr;
+      [result] = await connection.query(
+        `INSERT INTO counselors (counselor_id, name, email, phone, experience, expertise, status, number_of_students)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+        [counselorId, trimmedName, trimmedEmail, trimmedPhone, experience.trim(), expertise.trim(), status || 'Active']
+      );
+    }
     
     const newCounselorId = result.insertId;
     
@@ -220,9 +244,13 @@ router.post('/counselors', async (req, res) => {
     
     res.status(201).json({
       success: true,
-      message: 'Counselor added successfully!',
+      message: skippedRoleChange
+        ? 'Counselor added, but login could not be created because this email already belongs to another account type.'
+        : 'Counselor added successfully!',
       counselorId: newCounselorId,
-      generatedId: counselorId
+      generatedId: counselorId,
+      loginEmail: trimmedEmail,
+      temporaryPassword: skippedRoleChange ? null : plain,
     });
     
   } catch (error) {
@@ -308,13 +336,30 @@ router.put('/counselors/:counselorId', async (req, res) => {
       });
     }
     
+    await ensureCounselorUserLinkSchema();
+    const { userId: linkedUserId } = await createOrUpdateCounselorUser({
+      name: trimmedName,
+      email: trimmedEmail,
+      connection,
+    });
+
     // Update counselor
-    await connection.query(
-      `UPDATE counselors 
-       SET name = ?, email = ?, phone = ?, experience = ?, expertise = ?, status = ?
-       WHERE id = ?`,
-      [trimmedName, trimmedEmail, trimmedPhone, experience.trim(), expertise.trim(), status || 'Active', counselorId]
-    );
+    try {
+      await connection.query(
+        `UPDATE counselors 
+         SET name = ?, email = ?, phone = ?, experience = ?, expertise = ?, status = ?, user_id = COALESCE(?, user_id)
+         WHERE id = ?`,
+        [trimmedName, trimmedEmail, trimmedPhone, experience.trim(), expertise.trim(), status || 'Active', linkedUserId || null, counselorId]
+      );
+    } catch (updateErr) {
+      if (updateErr.code !== 'ER_BAD_FIELD_ERROR') throw updateErr;
+      await connection.query(
+        `UPDATE counselors 
+         SET name = ?, email = ?, phone = ?, experience = ?, expertise = ?, status = ?
+         WHERE id = ?`,
+        [trimmedName, trimmedEmail, trimmedPhone, experience.trim(), expertise.trim(), status || 'Active', counselorId]
+      );
+    }
     
     await connection.commit();
     

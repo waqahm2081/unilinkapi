@@ -9,6 +9,8 @@ import {
   transferStudentDocsToApplication,
   cleanupCopiedFiles,
 } from '../utils/transferStudentDocsToApplication.js';
+import { optionalAuthenticate } from '../middleware/auth.js';
+import { getCounselorProfileId } from '../utils/counselorAccess.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -267,9 +269,18 @@ const generateApplicationId = async (connection) => {
 // ============================================================
 // GET /applications — Get all applications
 // ============================================================
-router.get('/applications', async (req, res) => {
+router.get('/applications', optionalAuthenticate, async (req, res) => {
   try {
     await ensureApplicationSchema();
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const counselorFilter = counselorProfileId
+      ? `WHERE EXISTS (
+           SELECT 1 FROM student_counselors sc_scope
+           WHERE sc_scope.user_id = a.student_id AND sc_scope.counselor_id = ?
+         )`
+      : '';
+    const params = counselorProfileId ? [counselorProfileId] : [];
+
     const [applications] = await pool.query(
       `SELECT a.*,
               ${STUDENT_FULL_NAME_SQL} as student_display_name,
@@ -282,7 +293,9 @@ router.get('/applications', async (req, res) => {
        INNER JOIN countries c ON a.country_id = c.id
        LEFT JOIN universities un ON a.university_id = un.id
        LEFT JOIN intakes i ON a.intake_id = i.id
-       ORDER BY a.created_at DESC`
+       ${counselorFilter}
+       ORDER BY a.created_at DESC`,
+      params
     );
     const normalized = applications.map((app) => ({
       ...app,
@@ -301,8 +314,17 @@ router.get('/applications', async (req, res) => {
 // GET /applications/stats/overview
 // CHANGED: Added Accepted, Withdrawn counts; removed accepted_rejected counts
 // ============================================================
-router.get('/applications/stats/overview', async (req, res) => {
+router.get('/applications/stats/overview', optionalAuthenticate, async (req, res) => {
   try {
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const counselorFilter = counselorProfileId
+      ? `WHERE EXISTS (
+           SELECT 1 FROM student_counselors sc_scope
+           WHERE sc_scope.user_id = applications.student_id AND sc_scope.counselor_id = ?
+         )`
+      : '';
+    const params = counselorProfileId ? [counselorProfileId] : [];
+
     const [stats] = await pool.query(
       `SELECT 
         COUNT(*) as total_applications,
@@ -315,7 +337,9 @@ router.get('/applications/stats/overview', async (req, res) => {
         SUM(CASE WHEN application_status = 'Closed'    THEN 1 ELSE 0 END) as closed_applications,
         SUM(CASE WHEN deposit_paid = 'Yes'             THEN 1 ELSE 0 END) as deposit_paid_count,
         COUNT(DISTINCT student_id) as unique_students
-       FROM applications`
+       FROM applications
+       ${counselorFilter}`,
+      params
     );
     res.json({ success: true, stats: stats[0] });
   } catch (error) {
@@ -1068,9 +1092,19 @@ router.post('/applications/:applicationId/create-visa', async (req, res) => {
   }
 });
 
-router.get('/dashboard/stats', async (req, res) => {
+router.get('/dashboard/stats', optionalAuthenticate, async (req, res) => {
   try {
-    const [leadStats] = await pool.query(`
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const leadScope = counselorProfileId
+      ? `AND EXISTS (
+           SELECT 1 FROM lead_counselor_assignments lca_scope
+           WHERE lca_scope.lead_id = l.id AND lca_scope.counselor_id = ?
+         )`
+      : '';
+    const p = counselorProfileId ? [counselorProfileId] : [];
+
+    const [leadStats] = await pool.query(
+      `
       SELECT
         COUNT(*) AS total_leads,
         SUM(
@@ -1094,10 +1128,45 @@ router.get('/dashboard/stats', async (req, res) => {
         GROUP BY lead_id
       ) ca ON ca.lead_id = l.id
       WHERE (l.is_registered = FALSE OR l.is_registered IS NULL)
-    `);
-    const [studentStats] = await pool.query(`SELECT COUNT(*) as total_students FROM users WHERE role = 'client'`);
-    const [applicationStats] = await pool.query(`SELECT COUNT(*) as total_applications FROM applications`);
-    const [visaStats] = await pool.query(`SELECT SUM(CASE WHEN visa_status = 'Pending' THEN 1 ELSE 0 END) as pending_visas, SUM(CASE WHEN visa_status = 'Approved' THEN 1 ELSE 0 END) as approved_visas FROM visas`);
+        ${leadScope}
+    `,
+      p
+    );
+    const [studentStats] = await pool.query(
+      counselorProfileId
+        ? `SELECT COUNT(*) as total_students FROM users u
+           WHERE u.role = 'client'
+             AND EXISTS (
+               SELECT 1 FROM student_counselors sc_scope
+               WHERE sc_scope.user_id = u.id AND sc_scope.counselor_id = ?
+             )`
+        : `SELECT COUNT(*) as total_students FROM users WHERE role = 'client'`,
+      p
+    );
+    const [applicationStats] = await pool.query(
+      counselorProfileId
+        ? `SELECT COUNT(*) as total_applications FROM applications a
+           WHERE EXISTS (
+             SELECT 1 FROM student_counselors sc_scope
+             WHERE sc_scope.user_id = a.student_id AND sc_scope.counselor_id = ?
+           )`
+        : `SELECT COUNT(*) as total_applications FROM applications`,
+      p
+    );
+    const [visaStats] = await pool.query(
+      counselorProfileId
+        ? `SELECT SUM(CASE WHEN visa_status = 'Pending' THEN 1 ELSE 0 END) as pending_visas,
+                  SUM(CASE WHEN visa_status = 'Approved' THEN 1 ELSE 0 END) as approved_visas
+           FROM visas v
+           WHERE EXISTS (
+             SELECT 1 FROM student_counselors sc_scope
+             WHERE sc_scope.user_id = v.student_id AND sc_scope.counselor_id = ?
+           )`
+        : `SELECT SUM(CASE WHEN visa_status = 'Pending' THEN 1 ELSE 0 END) as pending_visas,
+                  SUM(CASE WHEN visa_status = 'Approved' THEN 1 ELSE 0 END) as approved_visas
+           FROM visas`,
+      p
+    );
     res.json({
       success: true,
       stats: {
@@ -1117,8 +1186,17 @@ router.get('/dashboard/stats', async (req, res) => {
   }
 });
 
-router.get('/dashboard/recent-applications', async (req, res) => {
+router.get('/dashboard/recent-applications', optionalAuthenticate, async (req, res) => {
   try {
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const counselorFilter = counselorProfileId
+      ? `AND EXISTS (
+           SELECT 1 FROM student_counselors sc_scope
+           WHERE sc_scope.user_id = a.student_id AND sc_scope.counselor_id = ?
+         )`
+      : '';
+    const params = counselorProfileId ? [counselorProfileId] : [];
+
     const [applications] = await pool.query(
       `SELECT 
          a.id, 
@@ -1135,11 +1213,14 @@ router.get('/dashboard/recent-applications', async (req, res) => {
        INNER JOIN countries c ON a.country_id = c.id
        LEFT JOIN student_counselors sc ON sc.user_id = a.student_id
        LEFT JOIN counselors co ON co.id = sc.counselor_id
+       WHERE 1=1
+         ${counselorFilter}
        GROUP BY 
          a.id, a.application_id, a.program, a.application_status, 
          a.created_at, u.name, u.middle_name, u.surname, u.student_id, c.country_name
        ORDER BY a.created_at DESC
-       LIMIT 5`
+       LIMIT 5`,
+      params
     );
     res.json({ success: true, applications });
   } catch (error) {

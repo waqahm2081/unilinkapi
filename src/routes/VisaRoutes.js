@@ -10,6 +10,8 @@ import {
   transferVisaDocsToVisa,
   cleanupCopiedFiles,
 } from '../utils/transferDocsToVisa.js';
+import { optionalAuthenticate } from '../middleware/auth.js';
+import { getCounselorProfileId } from '../utils/counselorAccess.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -156,11 +158,21 @@ const generateVisaId = async (connection) => {
 // CHANGED METHOD 1: GET /visas
 // Added: institute, submission_date, submitted_by to SELECT
 // ============================================================
-router.get('/visas', async (req, res) => {
+router.get('/visas', optionalAuthenticate, async (req, res) => {
   try {
     await ensureVisaSchema();
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const counselorFilter = counselorProfileId
+      ? `WHERE EXISTS (
+           SELECT 1 FROM student_counselors sc_scope
+           WHERE sc_scope.user_id = v.student_id AND sc_scope.counselor_id = ?
+         )`
+      : '';
+    const params = counselorProfileId ? [counselorProfileId] : [];
+
     const [visas] = await pool.query(
-      `${visaListSelect} ORDER BY v.created_at DESC`
+      `${visaListSelect} ${counselorFilter} ORDER BY v.created_at DESC`,
+      params
     );
 
     for (const visa of visas) {
@@ -188,10 +200,20 @@ router.get('/visas', async (req, res) => {
 // CHANGED METHOD 2: GET /visas/statistics
 // Updated to use new status values
 // ============================================================
-router.get('/visas/statistics', async (req, res) => {
+router.get('/visas/statistics', optionalAuthenticate, async (req, res) => {
   try {
     await ensureVisaSchema();
-    const [stats] = await pool.query(`
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const counselorFilter = counselorProfileId
+      ? `WHERE EXISTS (
+           SELECT 1 FROM student_counselors sc_scope
+           WHERE sc_scope.user_id = visas.student_id AND sc_scope.counselor_id = ?
+         )`
+      : '';
+    const params = counselorProfileId ? [counselorProfileId] : [];
+
+    const [stats] = await pool.query(
+      `
       SELECT 
         COUNT(*) AS total,
         SUM(CASE WHEN visa_status IN ('In Progress', 'To be applied') THEN 1 ELSE 0 END) AS in_progress,
@@ -203,7 +225,10 @@ router.get('/visas/statistics', async (req, res) => {
                   AND visa_appointment_date <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)
              THEN 1 ELSE 0 END) AS upcoming_appointments
       FROM visas
-    `);
+      ${counselorFilter}
+    `,
+      params
+    );
 
     res.json({ success: true, statistics: stats[0] });
 
@@ -222,7 +247,7 @@ router.get('/visas/statistics', async (req, res) => {
 // CHANGED METHOD 3: GET /visas/:visaId
 // Added: institute, submission_date, submitted_by to SELECT
 // ============================================================
-router.get('/visas/:visaId', async (req, res) => {
+router.get('/visas/:visaId', optionalAuthenticate, async (req, res) => {
   try {
     await ensureVisaSchema();
     const { visaId } = req.params;
@@ -234,6 +259,21 @@ router.get('/visas/:visaId', async (req, res) => {
 
     if (visas.length === 0) {
       return res.status(404).json({ success: false, message: 'Visa not found' });
+    }
+
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    if (counselorProfileId) {
+      const studentId = visas[0].student_id;
+      if (!studentId) {
+        return res.status(403).json({ success: false, message: 'Access denied for this visa' });
+      }
+      const [assigned] = await pool.query(
+        'SELECT id FROM student_counselors WHERE user_id = ? AND counselor_id = ? LIMIT 1',
+        [studentId, counselorProfileId]
+      );
+      if (!assigned.length) {
+        return res.status(403).json({ success: false, message: 'Access denied for this visa' });
+      }
     }
 
     const [documents] = await pool.query(

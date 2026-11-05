@@ -9,6 +9,8 @@ import { claimStudentRegistrationId } from '../utils/studentRegistrationId.js';
 import { qualificationsToEducationRows } from '../utils/qualificationsToEducation.js';
 import { ensureUploadSubdir } from '../config/uploads.js';
 import { notifyAdminsOfNewLead } from '../services/notificationService.js';
+import { optionalAuthenticate } from '../middleware/auth.js';
+import { getCounselorProfileId } from '../utils/counselorAccess.js';
 
 const router = express.Router();
 
@@ -906,10 +908,17 @@ router.get('/leads/:leadId/history', async (req, res) => {
 // Get all follow-up entries (one row per follow-up visit).
 // Also includes each lead's initial form submission as follow-up #1
 // (same convention as Edit Lead / Edit Student history).
-router.get('/leads/followups', async (req, res) => {
+router.get('/leads/followups', optionalAuthenticate, async (req, res) => {
   try {
     const view = req.query.view || 'active';
     const registrationFilter = getRegistrationFilter(view);
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const counselorFilter = counselorProfileId
+      ? `AND EXISTS (
+           SELECT 1 FROM lead_counselor_assignments lca_scope
+           WHERE lca_scope.lead_id = l.id AND lca_scope.counselor_id = ${Number(counselorProfileId)}
+         )`
+      : '';
 
     const leadCols = `
                 l.id,
@@ -936,7 +945,8 @@ router.get('/leads/followups', async (req, res) => {
              1 as is_initial
       FROM leads l
       WHERE ${registrationFilter}
-        AND l.created_at IS NOT NULL`;
+        AND l.created_at IS NOT NULL
+        ${counselorFilter}`;
 
     let followups;
     try {
@@ -952,6 +962,7 @@ router.get('/leads/followups', async (req, res) => {
            FROM follow_ups fu
            INNER JOIN leads l ON l.id = fu.lead_id
            WHERE ${registrationFilter}
+             ${counselorFilter}
            UNION ALL
            ${initialSelect}
          ) AS all_followups
@@ -972,6 +983,7 @@ router.get('/leads/followups', async (req, res) => {
            FROM follow_ups fu
            INNER JOIN leads l ON l.id = fu.lead_id
            WHERE ${registrationFilter}
+             ${counselorFilter}
            UNION ALL
            ${initialSelect}
          ) AS all_followups
@@ -999,13 +1011,21 @@ router.get('/leads/followups', async (req, res) => {
 });
 
 // Get all leads
-router.get('/leads', async (req, res) => {
+router.get('/leads', optionalAuthenticate, async (req, res) => {
   try {
     const view = req.query.view || 'active';
     const registrationFilter = getRegistrationFilter(view);
     const orderBy = view === 'registered'
       ? 'l.registered_at DESC'
       : 'l.created_at DESC';
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    const counselorFilter = counselorProfileId
+      ? `AND EXISTS (
+           SELECT 1 FROM lead_counselor_assignments lca_scope
+           WHERE lca_scope.lead_id = l.id AND lca_scope.counselor_id = ?
+         )`
+      : '';
+    const counselorParams = counselorProfileId ? [counselorProfileId] : [];
 
     const [leads] = await pool.query(
       `SELECT l.*,
@@ -1018,8 +1038,10 @@ router.get('/leads', async (req, res) => {
        LEFT JOIN follow_ups fu ON l.id = fu.lead_id
        LEFT JOIN lead_counselor_assignments lca ON l.id = lca.lead_id
        WHERE ${registrationFilter}
+         ${counselorFilter}
        GROUP BY l.id
-       ORDER BY ${orderBy}`
+       ORDER BY ${orderBy}`,
+      counselorParams
     );
 
     const [registeredCountRows] = await pool.query(
@@ -1040,9 +1062,19 @@ router.get('/leads', async (req, res) => {
 });
 
 // Get single lead by ID
-router.get('/leads/:leadId', async (req, res) => {
+router.get('/leads/:leadId', optionalAuthenticate, async (req, res) => {
   try {
     const { leadId } = req.params;
+    const counselorProfileId = await getCounselorProfileId(req.user);
+    if (counselorProfileId) {
+      const [assigned] = await pool.query(
+        'SELECT id FROM lead_counselor_assignments WHERE lead_id = ? AND counselor_id = ? LIMIT 1',
+        [leadId, counselorProfileId]
+      );
+      if (!assigned.length) {
+        return res.status(403).json({ success: false, message: 'Access denied for this lead' });
+      }
+    }
     const [leads] = await pool.query(
       `SELECT l.*,
               COUNT(DISTINCT fu.id) as follow_up_count,
