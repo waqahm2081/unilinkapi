@@ -57,6 +57,34 @@ const validatePhone = (phone) => {
   return phoneRegex.test(phone) && phone.replace(/\D/g, '').length >= 10;
 };
 
+const phoneDigits = (phone) => String(phone || '').replace(/\D/g, '');
+
+/** Strip common formatting so +92 300-1234567 matches 03001234567-style storage. */
+const PHONE_DIGITS_SQL = `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone,''), ' ', ''), '-', ''), '+', ''), '(', ''), ')', '')`;
+
+/**
+ * Find a non-registered lead that already uses this phone.
+ * Registered leads no longer block reuse of the number.
+ */
+const findActiveLeadByPhone = async (connection, phone, excludeLeadId = null) => {
+  const digits = phoneDigits(phone);
+  if (!digits) return null;
+  let sql = `
+    SELECT id, full_name, email, phone
+    FROM leads
+    WHERE ${PHONE_DIGITS_SQL} = ?
+      AND (is_registered = FALSE OR is_registered IS NULL)
+  `;
+  const params = [digits];
+  if (excludeLeadId != null) {
+    sql += ' AND id != ?';
+    params.push(excludeLeadId);
+  }
+  sql += ' LIMIT 1';
+  const [rows] = await connection.query(sql, params);
+  return rows[0] || null;
+};
+
 const REFERRED_BY_NAME_TRIGGERS = ['Friend or Family', 'Other', 'Person Name'];
 
 const requiresReferredByName = (referredBy) =>
@@ -471,6 +499,20 @@ router.post('/leads', async (req, res) => {
       });
     }
 
+    const existingPhoneLead = await findActiveLeadByPhone(connection, trimmedPhone);
+    if (existingPhoneLead) {
+      await connection.rollback();
+      return res.status(409).json({
+        success: false,
+        message: 'A lead with this phone number already exists. Please use the Follow Up option to update your information.',
+        existingLead: {
+          name: existingPhoneLead.full_name,
+          email: existingPhoneLead.email,
+          phone: existingPhoneLead.phone,
+        },
+      });
+    }
+
     const countriesJson = serializeCountries(countriesOfInterest);
     const qualificationsJson = serializeQualifications(qualifications);
     const admissionTestsJson = serializeAdmissionTests(admissionTests);
@@ -747,6 +789,17 @@ router.post('/leads/:leadId/follow-up', async (req, res) => {
       if (emailCheck.length > 0) {
         await connection.rollback();
         return res.status(409).json({ success: false, message: 'This email address is already associated with another record. Please use a different email.' });
+      }
+    }
+
+    if (phoneDigits(trimmedPhone) !== phoneDigits(oldData.phone)) {
+      const existingPhoneLead = await findActiveLeadByPhone(connection, trimmedPhone, leadId);
+      if (existingPhoneLead) {
+        await connection.rollback();
+        return res.status(409).json({
+          success: false,
+          message: 'This phone number is already associated with another active lead. Please use a different number or the Follow Up option.',
+        });
       }
     }
     
@@ -1152,6 +1205,15 @@ router.put('/leads/:leadId', async (req, res) => {
     if (emailCheck.length > 0) {
       await connection.rollback();
       return res.status(409).json({ success: false, message: 'This email address is already associated with another lead' });
+    }
+
+    const existingPhoneLead = await findActiveLeadByPhone(connection, trimmedPhone, leadId);
+    if (existingPhoneLead) {
+      await connection.rollback();
+      return res.status(409).json({
+        success: false,
+        message: 'This phone number is already associated with another active lead',
+      });
     }
 
     const countriesJson = serializeCountries(countriesOfInterest);
